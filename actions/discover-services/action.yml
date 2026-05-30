@@ -90,6 +90,7 @@ runs:
         # For each service yaml, emit one line:
         #   name|ecr_repo|dockerfile|target|build_args|source_pattern_regex
         declare -a SERVICE_DEFS=()
+        declare -a BUILD_ERRORS=()
         while IFS= read -r svc_yaml; do
           name=$(yq -r '.name' "$svc_yaml")
           ecr=$(yq -r '.repositories.image' "$svc_yaml")
@@ -98,6 +99,29 @@ runs:
           target=$(yq -r '.build.target // "production"' "$svc_yaml")
           if [ "$name" = "null" ] || [ "$ecr" = "null" ]; then
             echo "::warning::skipping $svc_yaml — missing name or repositories.image"
+            continue
+          fi
+
+          # Validate the resolved (dockerfile, target) pair against disk
+          # BEFORE we hand the matrix off to docker-release.yml. The
+          # default fallback to `Dockerfile` + `target=production` is
+          # silent — on multi-Dockerfile repos (e.g. trader-tools' root
+          # `Dockerfile` / `Dockerfile.backend` / `Dockerfile.ui`) the
+          # default produces the wrong artifact instead of failing.
+          # See trader-tools#482 + pinpredict/.github#5 for the incident.
+          # Errors are collected (not exited early) so a single CI run
+          # surfaces every broken service at once.
+          if [ ! -f "$dockerfile" ]; then
+            BUILD_ERRORS+=("${name} (${svc_yaml}): declared build.dockerfile '${dockerfile}' does not exist in the repo")
+            continue
+          fi
+          # Match `FROM <image> AS <target>` with optional `--platform=`
+          # and case-insensitive `AS` (Docker accepts both `AS` and `as`).
+          if ! grep -qiE "^FROM[[:space:]]+([[:space:]]*--platform=[^[:space:]]+[[:space:]]+)?[^[:space:]]+[[:space:]]+AS[[:space:]]+${target}([[:space:]]|$)" "$dockerfile"; then
+            stages=$(grep -iE '^FROM[[:space:]].*[[:space:]]AS[[:space:]]' "$dockerfile" \
+              | sed -E 's/.*[[:space:]][Aa][Ss][[:space:]]+([^[:space:]]+).*/\1/' \
+              | paste -sd', ' -)
+            BUILD_ERRORS+=("${name} (${svc_yaml}): target '${target}' is not a named stage in ${dockerfile} (found stages: ${stages:-<none>})")
             continue
           fi
           # Join sourcePaths[] with `|` — that's the same delimiter the
@@ -123,6 +147,16 @@ runs:
 
           SERVICE_DEFS+=("${name}|${ecr}|${dockerfile}|${target}|${build_args}|${source_patterns}")
         done < <(find .platform/services -maxdepth 1 -name '*.yaml' ! -name '.schema*' -print 2>/dev/null | sort)
+
+        # Fail loud on any (dockerfile, target) validation failures. Done
+        # after the full sweep so all invalid services show up in one run.
+        if [ ${#BUILD_ERRORS[@]} -gt 0 ]; then
+          echo "::error::discover-services: ${#BUILD_ERRORS[@]} service(s) have an invalid build configuration"
+          for err in "${BUILD_ERRORS[@]}"; do
+            echo "::error::${err}"
+          done
+          exit 1
+        fi
 
         if [ ${#SERVICE_DEFS[@]} -eq 0 ]; then
           echo "::warning::No services discovered under .platform/services/*.yaml"
