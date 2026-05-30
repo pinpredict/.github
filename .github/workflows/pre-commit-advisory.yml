@@ -1,0 +1,138 @@
+name: Pre-commit (advisory)
+
+# Non-blocking pre-commit run that surfaces what the repo's local
+# pre-commit hooks would flag on this PR's diff. Posts (or updates) a
+# sticky PR comment with the output, and fails the job on hook failure
+# so engineers see a ❌ check — but this workflow is NOT required for
+# merge in any repo's branch protection, so it never blocks.
+#
+# Why advisory and not required: org-wide pre-commit configs accumulate
+# over time, and existing repos carry pre-existing violations. Forcing
+# every PR to fix the org-wide debt before merge would block real work.
+# We scope to PR-diff (--from-ref/--to-ref) so engineers only see
+# violations they introduced or touched, and let social pressure build
+# the habit without a hard gate.
+#
+# If a repo wants to harden this into a merge-blocking check, add this
+# workflow's job name to the repo's branch protection required checks
+# in the GitHub UI — no caller-side YAML change needed.
+
+on:
+  workflow_call:
+    inputs:
+      python-version:
+        description: "Python version used to run pre-commit (the hooks themselves use their own languages)."
+        type: string
+        default: "3.13"
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  advisory:
+    runs-on: ubuntu-latest
+    # Only meaningful on PRs — on push, the diff base is ambiguous and
+    # the value (already-merged code) is lower. Callers can still invoke
+    # this on push if they want; the job will skip cleanly.
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - name: Cache pre-commit envs
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pre-commit
+          key: pre-commit-${{ runner.os }}-py${{ inputs.python-version }}-${{ hashFiles('.pre-commit-config.yaml') }}
+          restore-keys: |
+            pre-commit-${{ runner.os }}-py${{ inputs.python-version }}-
+
+      - name: Install pre-commit
+        run: pip install --upgrade pip pre-commit
+
+      - name: Run pre-commit on PR diff
+        id: precommit
+        continue-on-error: true
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set +e
+          # --from-ref/--to-ref restricts the run to files changed in
+          # this PR's diff, so engineers don't get blasted with org-wide
+          # pre-existing violations on unrelated lines.
+          pre-commit run \
+            --from-ref "$BASE_SHA" \
+            --to-ref "$HEAD_SHA" \
+            --show-diff-on-failure \
+            --color never \
+            2>&1 | tee /tmp/precommit.log
+          echo "exit_code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+
+      - name: Build PR comment body
+        id: body
+        env:
+          EXIT_CODE: ${{ steps.precommit.outputs.exit_code }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          if [ "$EXIT_CODE" = "0" ]; then
+            cat > /tmp/body.md <<EOF
+          <!-- pre-commit-advisory -->
+          ✅ **pre-commit (advisory)** — no issues on changed files.
+          EOF
+          else
+            # Truncate the log to a reasonable comment size — GitHub
+            # comments cap at 65k chars; keep a safe margin for the
+            # surrounding boilerplate.
+            log_excerpt=$(head -c 50000 /tmp/precommit.log)
+            {
+              echo "<!-- pre-commit-advisory -->"
+              echo "⚠️ **pre-commit (advisory)** would flag the following on this PR's diff."
+              echo ""
+              echo "This check is **non-blocking** — it surfaces what your local pre-commit hooks would catch. To reproduce + fix locally:"
+              echo ""
+              echo '```bash'
+              echo "pre-commit run --from-ref origin/main --to-ref HEAD"
+              echo '```'
+              echo ""
+              echo "Full run log: $RUN_URL"
+              echo ""
+              echo "<details><summary>Hook output (truncated to 50KB)</summary>"
+              echo ""
+              echo '```'
+              echo "$log_excerpt"
+              echo '```'
+              echo ""
+              echo "</details>"
+            } > /tmp/body.md
+          fi
+          echo "path=/tmp/body.md" >> "$GITHUB_OUTPUT"
+
+      - name: Find existing advisory comment
+        id: find
+        uses: peter-evans/find-comment@v3
+        with:
+          issue-number: ${{ github.event.pull_request.number }}
+          comment-author: github-actions[bot]
+          body-includes: <!-- pre-commit-advisory -->
+
+      - name: Post or update PR comment
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          comment-id: ${{ steps.find.outputs.comment-id }}
+          issue-number: ${{ github.event.pull_request.number }}
+          body-path: ${{ steps.body.outputs.path }}
+          edit-mode: replace
+
+      - name: Reflect pre-commit exit code as the job's status
+        if: steps.precommit.outputs.exit_code != '0'
+        run: |
+          echo "::error::pre-commit found issues on this PR's diff. See the sticky PR comment and the run log."
+          exit 1
