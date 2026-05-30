@@ -1,0 +1,24 @@
+name: Setup Go
+description: |
+  Install Go from the repo's go.mod toolchain directive. Standard Go-setup
+  recipe for pinpredict Go repos (service-template and anything templated
+  from it).
+
+  actions/setup-go@v6 caches the Go SDK + module cache by default; warm
+  runs skip both downloads. Reading the version from go.mod means the
+  caller doesn't pin Go in two places — bumping `go x.yy.z` in go.mod
+  drives CI.
+
+inputs:
+  go-version-file:
+    description: "Path to go.mod (or any file with a `go` directive)."
+    required: false
+    default: "go.mod"
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Go
+      uses: actions/setup-go@v6
+      with:
+        go-version-file: ${{ inputs.go-version-file }}
