@@ -1,0 +1,50 @@
+name: Setup Node + pnpm
+description: |
+  Enable corepack, install Node, set up pnpm cache, and optionally run
+  `pnpm install --frozen-lockfile [--filter <pkg>...]`. Standard Node-setup
+  recipe for pinpredict pnpm-workspace repos (trader-tools).
+
+  setup-node@v4's `cache: pnpm` handles the content-addressable pnpm store
+  (`~/.local/share/pnpm/store`); install is mostly symlink creation after
+  the first warm run.
+
+inputs:
+  node-version:
+    description: "Node version."
+    required: false
+    default: "24"
+  pnpm-filter:
+    description: |
+      pnpm workspace filter (e.g. `@pp/frontend`). Passes
+      `--filter <value>...` to install only that package and its workspace
+      dependencies. Leave empty to install every package in the workspace.
+    required: false
+    default: ""
+  install:
+    description: "When true (default), run pnpm install after Node setup."
+    required: false
+    default: "true"
+
+runs:
+  using: composite
+  steps:
+    - name: Enable corepack (pnpm)
+      shell: bash
+      run: corepack enable
+
+    - name: Set up Node.js ${{ inputs.node-version }}
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ inputs.node-version }}
+        cache: pnpm
+        cache-dependency-path: pnpm-lock.yaml
+
+    - name: pnpm install
+      if: inputs.install == 'true'
+      shell: bash
+      run: |
+        if [ -n "${{ inputs.pnpm-filter }}" ]; then
+          pnpm install --frozen-lockfile --filter "${{ inputs.pnpm-filter }}..."
+        else
+          pnpm install --frozen-lockfile
+        fi

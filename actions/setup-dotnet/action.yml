@@ -1,0 +1,51 @@
+name: Setup .NET
+description: |
+  Install the .NET SDK + cache NuGet packages by `**/*.csproj` lockfile +
+  optionally run `dotnet tool restore`. Standard .NET-setup recipe for
+  pinpredict .NET repos (trading).
+
+  setup-dotnet@v5's `cache: true` with `cache-dependency-path` keys the
+  NuGet cache on the project file hash; warm runs skip the package
+  download.
+
+inputs:
+  dotnet-version:
+    description: "SDK version."
+    required: false
+    default: "10.0.x"
+  cache-nuget:
+    description: |
+      When true (default), enable NuGet cache via setup-dotnet's built-in
+      cache, keyed on **/*.csproj.
+    required: false
+    default: "true"
+  tool-restore:
+    description: |
+      When true, run `dotnet tool restore` after SDK setup. Required when
+      the repo declares local tools (e.g. csharpier) in
+      .config/dotnet-tools.json. Defaults to false because not every job
+      needs tools (test runs typically don't).
+    required: false
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    - name: Set up .NET ${{ inputs.dotnet-version }} (with NuGet cache)
+      if: inputs.cache-nuget == 'true'
+      uses: actions/setup-dotnet@v5
+      with:
+        dotnet-version: ${{ inputs.dotnet-version }}
+        cache: true
+        cache-dependency-path: "**/*.csproj"
+
+    - name: Set up .NET ${{ inputs.dotnet-version }} (no cache)
+      if: inputs.cache-nuget != 'true'
+      uses: actions/setup-dotnet@v5
+      with:
+        dotnet-version: ${{ inputs.dotnet-version }}
+
+    - name: Restore .NET tools
+      if: inputs.tool-restore == 'true'
+      shell: bash
+      run: dotnet tool restore

@@ -19,6 +19,40 @@ Why `.github` and not a dedicated `github-actions` repo: `.github` is *the* GitH
 | Action | Purpose |
 |---|---|
 | `discover-services` | Reads `.platform/services/*.yaml` and emits a docker matrix of services whose docker-relevant files changed since their last `image/<name>/*` tag. Also emits `charts_changed`. |
+| `setup-python-uv` | Install uv + a pinned Python version + (default-on) `uv sync`. |
+| `setup-node-pnpm` | corepack + setup-node@v4 with pnpm cache + (default-on) `pnpm install --frozen-lockfile`. Accepts a `pnpm-filter` input for workspace filtering. |
+| `setup-dotnet` | setup-dotnet@v5 with NuGet cache keyed on `**/*.csproj` + (default-off) `dotnet tool restore`. |
+| `setup-go` | setup-go@v6 reading version from `go.mod`. |
+
+#### Language setup composites — usage
+
+```yaml
+# Python (dis, replay, magellan, trader-tools BFF)
+- uses: pinpredict/.github/actions/setup-python-uv@main
+  with:
+    python-version: "3.13"   # optional; default "3.13"
+    uv-sync: "true"          # optional; default true. Set "false" if the job
+                              # only needs Python without dependency install.
+
+# Node (trader-tools frontend / backend)
+- uses: pinpredict/.github/actions/setup-node-pnpm@main
+  with:
+    node-version: "24"          # optional; default "24"
+    pnpm-filter: "@pp/frontend" # optional; installs only that package + deps
+                                  # via `--filter <value>...`. Empty = whole workspace.
+
+# .NET (trading)
+- uses: pinpredict/.github/actions/setup-dotnet@main
+  with:
+    dotnet-version: "10.0.x"  # optional; default "10.0.x"
+    cache-nuget: "true"       # optional; default true. Keys on **/*.csproj
+    tool-restore: "true"      # optional; default false. Required for csharpier etc.
+
+# Go (service-template)
+- uses: pinpredict/.github/actions/setup-go@main
+  with:
+    go-version-file: "go.mod" # optional; default "go.mod"
+```
 
 ## How to use
 
