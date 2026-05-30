@@ -1,0 +1,267 @@
+name: Docker Release
+
+# Reusable matrix-based image build/push.
+#
+# The caller owns the service catalog. It passes `matrix` as a JSON string
+# in the GitHub Actions matrix include shape:
+#
+#   {
+#     "include": [
+#       {
+#         "name": "trader-tools",        # required: ECR repo basename + tag service segment
+#         "ecr_repo": "trader-tools",    # required: full ECR repo path (e.g. "trading/oms")
+#         "dockerfile": "Dockerfile",    # optional: defaults to "Dockerfile"
+#         "target": "production",        # optional: docker --target value
+#         "build_args": "KEY=VAL\nK2=V2" # optional: newline-separated --build-arg entries
+#       }
+#     ]
+#   }
+#
+# Each successful build pushes the image, creates an immutable git tag
+# `image/<name>/X.Y.Z`, and contributes to a single aggregated GitHub
+# Release at the end of the run. Pinpoint correlates on the per-service
+# git tags via the `create` webhook, so multi-service runs map cleanly to
+# per-service deploy flows.
+
+on:
+  workflow_call:
+    inputs:
+      matrix:
+        description: "JSON matrix of services to build (GitHub Actions matrix `include` shape)"
+        required: true
+        type: string
+
+env:
+  AWS_REGION: us-east-1
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+concurrency:
+  group: docker-release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: ${{ fromJson(inputs.matrix).include[0] != null }}
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(inputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      # AssumeRole on a per-service xp-<svc>-gha-push role can race with
+      # Crossplane creating that role for the first time. AccessDenied
+      # is non-retryable inside aws-actions/configure-aws-credentials,
+      # so the action's built-in backoff gives up before the role
+      # exists. See chart-release.yml's equivalent block for the live
+      # incident this protects against (pinpredict/trading#616's
+      # 2-second race on first colocation).
+      #
+      # Three-shot pattern: try, sleep 30, retry, sleep 60, retry. Only
+      # the final step's failure is fatal. Zero added time on the
+      # steady-state path; bounded ~90s on a first-colocation race.
+      - name: Configure AWS credentials (attempt 1)
+        id: aws-attempt-1
+        uses: aws-actions/configure-aws-credentials@v6
+        continue-on-error: true
+        with:
+          # Per-service push role when the detect-changes step set one
+          # (services migrated to .platform/services/<svc>.yaml's
+          # `repositories:` block per platform-gitops#524). Empty
+          # `matrix.role` for un-migrated services falls through to
+          # the central xp-trading-gha-push role still held in
+          # secrets.AWS_ROLE_ARN.
+          role-to-assume: ${{ matrix.role || secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Wait for IAM role propagation (attempt 1 failed)
+        if: steps.aws-attempt-1.outcome == 'failure'
+        run: sleep 30
+
+      - name: Configure AWS credentials (attempt 2)
+        id: aws-attempt-2
+        if: steps.aws-attempt-1.outcome == 'failure'
+        uses: aws-actions/configure-aws-credentials@v6
+        continue-on-error: true
+        with:
+          role-to-assume: ${{ matrix.role || secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Wait for IAM role propagation (attempt 2 failed)
+        if: steps.aws-attempt-2.outcome == 'failure'
+        run: sleep 60
+
+      - name: Configure AWS credentials (attempt 3, fatal)
+        if: steps.aws-attempt-2.outcome == 'failure'
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ matrix.role || secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Resolve version, build, push, tag
+        id: release
+        env:
+          NAME: ${{ matrix.name }}
+          ECR_REPO: ${{ matrix.ecr_repo }}
+          DOCKERFILE: ${{ matrix.dockerfile || 'Dockerfile' }}
+          TARGET: ${{ matrix.target }}
+          BUILD_ARGS: ${{ matrix.build_args }}
+          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          SHORT_SHA: ${{ github.sha }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          SHORT_SHA="${SHORT_SHA:0:7}"
+
+          # Compute candidate version from latest existing tag
+          prefix="image/${NAME}/"
+          latest_tag=$(git tag --list "${prefix}*" --sort=-v:refname \
+            | grep -E "^image/${NAME}/[0-9]+\.[0-9]+\.[0-9]+$" | head -n1 || true)
+
+          if [ -z "$latest_tag" ]; then
+            major=0; minor=0; patch=0
+          else
+            version="${latest_tag#${prefix}}"
+            IFS='.' read -r major minor patch <<< "$version"
+          fi
+          patch=$((patch + 1))
+
+          # Bump past any version that already exists as a git tag or in
+          # ECR (immutable). Recovers stranded ECR images that lost their
+          # git tag from a prior partial run.
+          while true; do
+            candidate="${major}.${minor}.${patch}"
+            tag="image/${NAME}/${candidate}"
+
+            if git tag --list "$tag" | grep -q .; then
+              echo "Git tag ${tag} already exists — bumping"
+              patch=$((patch + 1))
+              continue
+            fi
+
+            if aws ecr describe-images \
+                --repository-name "${ECR_REPO}" \
+                --image-ids imageTag="${candidate}" >/dev/null 2>&1; then
+              echo "::warning::Image ${ECR_REPO}:${candidate} exists in ECR but no git tag — recovering"
+              git tag "$tag"
+              git push origin "$tag" || echo "::warning::Recovery tag push failed for ${tag}"
+              patch=$((patch + 1))
+              continue
+            fi
+
+            break
+          done
+          version="${major}.${minor}.${patch}"
+          tag="image/${NAME}/${version}"
+
+          echo "Building ${ECR_REPO} v${version} from ${DOCKERFILE}${TARGET:+ (target=${TARGET})}"
+
+          buildx_args=(
+            --platform linux/amd64
+            --push
+            --provenance=false
+            --cache-from "type=gha,scope=${NAME}"
+            --cache-to "type=gha,mode=max,scope=${NAME}"
+            -t "${ECR_REGISTRY}/${ECR_REPO}:${version}"
+            -t "${ECR_REGISTRY}/${ECR_REPO}:${version}-${SHORT_SHA}"
+            -f "${DOCKERFILE}"
+          )
+          if [ -n "${TARGET}" ]; then
+            buildx_args+=(--target "${TARGET}")
+          fi
+          if [ -n "${BUILD_ARGS}" ]; then
+            while IFS= read -r ba; do
+              [ -z "$ba" ] && continue
+              buildx_args+=(--build-arg "$ba")
+            done <<< "${BUILD_ARGS}"
+          fi
+
+          docker buildx build "${buildx_args[@]}" .
+
+          # Tag immediately after successful push (retry up to 3 times).
+          # If the tag push fails permanently the image is in ECR with no
+          # git tag — the next run's recovery loop will reclaim it.
+          git tag "$tag"
+          tag_pushed=false
+          for attempt in 1 2 3; do
+            if git push origin "$tag"; then
+              tag_pushed=true
+              break
+            fi
+            echo "::warning::Git tag push attempt ${attempt}/3 failed for ${tag}"
+            sleep 2
+          done
+
+          if [ "$tag_pushed" != true ]; then
+            echo "::error::Git tag push failed after 3 attempts for ${tag} — image already in ECR!"
+            exit 1
+          fi
+
+          mkdir -p release-info
+          echo "${NAME} ${version}" > "release-info/${NAME}.txt"
+
+      - name: Upload release info
+        if: steps.release.outcome == 'success'
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-info-${{ matrix.name }}
+          path: release-info/${{ matrix.name }}.txt
+          retention-days: 1
+
+  release-summary:
+    needs: build
+    if: ${{ !cancelled() && needs.build.result != 'skipped' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download release-info artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: release-info
+          pattern: release-info-*
+          merge-multiple: true
+
+      - name: Create aggregated GitHub release
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          released=()
+          for f in release-info/*.txt; do
+            released+=("$(cat "$f")")
+          done
+
+          if [ ${#released[@]} -eq 0 ]; then
+            echo "No services were released."
+            exit 0
+          fi
+
+          title="Release: $(IFS=', '; echo "${released[*]}")"
+          first_name="${released[0]%% *}"
+          first_ver="${released[0]##* }"
+          gh release create "image/${first_name}/${first_ver}" \
+            --generate-notes \
+            --title "$title"
+
+      - name: Fail if any build failed
+        if: needs.build.result != 'success'
+        run: |
+          echo "::error::One or more service builds failed (build job result: ${{ needs.build.result }})"
+          exit 1

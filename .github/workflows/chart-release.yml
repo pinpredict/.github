@@ -1,0 +1,297 @@
+name: Helm Chart Release
+
+# Reusable matrix-based Helm chart release.
+#
+# Auto-discovers charts under `charts/*/`. For each chart:
+#   - Computes the next `chart/<name>/X.Y.Z` tag.
+#   - Skips charts unchanged since their last release tag (unless
+#     workflow_dispatch forced a release).
+#   - Packages, pushes to ECR OCI, tags, contributes to one aggregated
+#     GitHub Release. Bumps past versions that already exist in ECR
+#     (immutable) — recovers stranded versions from prior partial runs.
+#
+# Caller has no inputs; auto-discovery handles everything. Each repo's
+# `ci.yml` decides whether to call this workflow.
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REGISTRY: 784682930591.dkr.ecr.us-east-1.amazonaws.com
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+concurrency:
+  group: chart-release
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set.outputs.matrix }}
+      any: ${{ steps.set.outputs.any }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Discover charts and compute candidate versions
+        id: set
+        run: |
+          set -euo pipefail
+          force=${{ github.event_name == 'workflow_dispatch' }}
+          entries=()
+
+          # Per-service IAM push role. All trading services are
+          # self-service-deploy-migrated; each chart's push role follows
+          # the deterministic naming `xp-<name>-gha-push` rendered by
+          # the per-service Service XR composition (platform-gitops#524
+          # / #526). A chart whose `name:` doesn't exist as a service
+          # under `.platform/services/` would have no such role minted —
+          # `role=""` falls back to ${{ secrets.AWS_ROLE_ARN }} in the
+          # package job below.
+          DEV_ACCOUNT_ID=784682930591
+          per_service_role() {
+            if [ -f ".platform/services/$1.yaml" ]; then
+              echo "arn:aws:iam::${DEV_ACCOUNT_ID}:role/xp-$1-gha-push"
+            else
+              echo ""
+            fi
+          }
+
+          for chart_dir in charts/*/; do
+            [ -f "${chart_dir}Chart.yaml" ] || continue
+            name=$(grep '^name:' "${chart_dir}Chart.yaml" | awk '{print $2}')
+
+            prefix="chart/${name}/"
+            latest=$(git tag --list "${prefix}*" --sort=-v:refname \
+              | grep -E "^chart/${name}/[0-9]+\.[0-9]+\.[0-9]+$" | head -n1 || true)
+
+            if [ -z "$latest" ]; then
+              candidate="0.0.1"
+            else
+              version="${latest#${prefix}}"
+              IFS='.' read -r major minor patch <<< "$version"
+              candidate="${major}.${minor}.$((patch + 1))"
+            fi
+
+            # Skip unchanged charts unless dispatch forced a release
+            if [ "$force" != "true" ] && [ -n "$latest" ]; then
+              changed=$(git diff --name-only "${latest}..HEAD" -- "${chart_dir}" || true)
+              if [ -z "$changed" ]; then
+                echo "${name}: no changes since ${latest} — skipping"
+                continue
+              fi
+            fi
+
+            echo "${name}: candidate ${candidate}"
+            dir="${chart_dir%/}"
+            role=$(per_service_role "$name")
+            entries+=("{\"name\":\"${name}\",\"dir\":\"${dir}\",\"version\":\"${candidate}\",\"role\":\"${role}\"}")
+          done
+
+          if [ ${#entries[@]} -eq 0 ]; then
+            echo "matrix={\"include\":[]}" >> "$GITHUB_OUTPUT"
+            echo "any=false" >> "$GITHUB_OUTPUT"
+            echo "No charts to release."
+            exit 0
+          fi
+
+          json="{\"include\":[$(IFS=,; echo "${entries[*]}")]}"
+          echo "matrix=${json}" >> "$GITHUB_OUTPUT"
+          echo "any=true" >> "$GITHUB_OUTPUT"
+          echo "Matrix: ${json}"
+
+  package:
+    needs: prepare
+    if: needs.prepare.outputs.any == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      # AssumeRole on a per-service xp-<svc>-gha-push role can race with
+      # Crossplane creating that role for the first time. Observed in
+      # pinpredict/trading#616: this workflow ran at 04:50:53 UTC and
+      # `Not authorized to perform sts:AssumeRoleWithWebIdentity` came
+      # back; the Crossplane composition created the role at 04:50:55,
+      # two seconds too late. AccessDenied is non-retryable inside
+      # aws-actions/configure-aws-credentials so the action's built-in
+      # backoff gives up after ~50s before the role exists.
+      #
+      # Three-shot pattern: try, sleep 30, retry, sleep 60, retry. Only
+      # the final step's failure is fatal. Zero added time on the
+      # steady-state path (first attempt succeeds); bounded ~90s on a
+      # first-colocation race.
+      - name: Configure AWS credentials (attempt 1)
+        id: aws-attempt-1
+        uses: aws-actions/configure-aws-credentials@v6
+        continue-on-error: true
+        with:
+          # Per-service push role when the prepare step set one
+          # (charts migrated to .platform/services/<svc>.yaml's
+          # `repositories:` block per platform-gitops#524). Empty
+          # `matrix.role` for un-migrated charts falls through to
+          # the central xp-trading-gha-push role in
+          # secrets.AWS_ROLE_ARN.
+          role-to-assume: ${{ matrix.role || secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Wait for IAM role propagation (attempt 1 failed)
+        if: steps.aws-attempt-1.outcome == 'failure'
+        run: sleep 30
+
+      - name: Configure AWS credentials (attempt 2)
+        id: aws-attempt-2
+        if: steps.aws-attempt-1.outcome == 'failure'
+        uses: aws-actions/configure-aws-credentials@v6
+        continue-on-error: true
+        with:
+          role-to-assume: ${{ matrix.role || secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Wait for IAM role propagation (attempt 2 failed)
+        if: steps.aws-attempt-2.outcome == 'failure'
+        run: sleep 60
+
+      - name: Configure AWS credentials (attempt 3, fatal)
+        if: steps.aws-attempt-2.outcome == 'failure'
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ matrix.role || secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Install Helm
+        uses: azure/setup-helm@v5
+
+      - name: Resolve version, package, push, tag
+        id: release
+        env:
+          NAME: ${{ matrix.name }}
+          DIR: ${{ matrix.dir }}
+          CANDIDATE: ${{ matrix.version }}
+        run: |
+          set -euo pipefail
+          IFS='.' read -r major minor patch <<< "$CANDIDATE"
+
+          # Bump past versions already in ECR (immutable). Recover
+          # stranded ECR pushes that lost their git tag.
+          while true; do
+            version="${major}.${minor}.${patch}"
+            tag="chart/${NAME}/${version}"
+
+            if git tag --list "$tag" | grep -q .; then
+              echo "Git tag ${tag} already exists — bumping"
+              patch=$((patch + 1))
+              continue
+            fi
+
+            if helm show chart "oci://${ECR_REGISTRY}/charts/${NAME}" --version "${version}" >/dev/null 2>&1; then
+              echo "::warning::Chart ${NAME}:${version} exists in ECR but no git tag — recovering"
+              git tag "$tag"
+              git push origin "$tag" || echo "::warning::Recovery tag push failed for ${tag}"
+              patch=$((patch + 1))
+              continue
+            fi
+
+            break
+          done
+          version="${major}.${minor}.${patch}"
+          tag="chart/${NAME}/${version}"
+
+          # Stamp the resolved version into Chart.yaml before packaging
+          sed -i "s/^version:.*/version: ${version}/" "${DIR}/Chart.yaml"
+          sed -i "s/^appVersion:.*/appVersion: \"${version}\"/" "${DIR}/Chart.yaml"
+
+          echo "Packaging ${NAME} v${version} from ${DIR}"
+          helm package "${DIR}"
+          helm push "${NAME}-${version}.tgz" "oci://${ECR_REGISTRY}/charts"
+
+          # Tag immediately after successful push (retry up to 3 times).
+          # If permanent failure the chart sits in ECR with no git tag —
+          # the next run's recovery loop will reclaim it.
+          git tag "$tag"
+          tag_pushed=false
+          for attempt in 1 2 3; do
+            if git push origin "$tag"; then
+              tag_pushed=true
+              break
+            fi
+            echo "::warning::Git tag push attempt ${attempt}/3 failed for ${tag}"
+            sleep 2
+          done
+
+          if [ "$tag_pushed" != true ]; then
+            echo "::error::Git tag push failed after 3 attempts for ${tag} — chart already in ECR!"
+            exit 1
+          fi
+
+          mkdir -p release-info
+          echo "${NAME} ${version}" > "release-info/${NAME}.txt"
+
+      - name: Upload release info
+        if: steps.release.outcome == 'success'
+        uses: actions/upload-artifact@v7
+        with:
+          name: chart-release-info-${{ matrix.name }}
+          path: release-info/${{ matrix.name }}.txt
+          retention-days: 1
+
+  release-summary:
+    needs: package
+    if: ${{ !cancelled() && needs.package.result != 'skipped' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download chart-release-info artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: release-info
+          pattern: chart-release-info-*
+          merge-multiple: true
+
+      - name: Create aggregated GitHub release
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          released=()
+          for f in release-info/*.txt; do
+            released+=("$(cat "$f")")
+          done
+
+          if [ ${#released[@]} -eq 0 ]; then
+            echo "No charts were released."
+            exit 0
+          fi
+
+          title="Charts: $(IFS=', '; echo "${released[*]}")"
+          first_name="${released[0]%% *}"
+          first_ver="${released[0]##* }"
+          gh release create "chart/${first_name}/${first_ver}" \
+            --generate-notes \
+            --title "$title"
+
+      - name: Fail if any package failed
+        if: needs.package.result != 'success'
+        run: |
+          echo "::error::One or more chart packages failed (package job result: ${{ needs.package.result }})"
+          exit 1

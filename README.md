@@ -1,0 +1,119 @@
+# pinpredict/.github
+
+Org-default repo for pinpredict. Holds shared GitHub Actions reusable workflows + composite actions consumed by service repos, and will hold future org-default surface (issue templates, SECURITY.md, profile README, etc.) as those are added.
+
+Why `.github` and not a dedicated `github-actions` repo: `.github` is *the* GitHub convention for org-wide infrastructure. Putting reusable workflows here means one repo holds anything org-default — no recurring "which repo for which org-default" question.
+
+## What's here
+
+### Reusable workflows (`.github/workflows/`)
+
+| File | Purpose |
+|---|---|
+| `docker-release.yml` | Matrix-based image build + push to ECR; per-service `image/<name>/X.Y.Z` git tags; aggregated GitHub Release. Caller passes a `matrix` input in the standard `{include:[...]}` shape. |
+| `chart-release.yml` | Auto-discovers `charts/*/`, bumps versions, packages, pushes to ECR OCI, tags `chart/<name>/X.Y.Z`. No caller inputs. |
+| `tag-config.yml` | Tags merges to main that touch `.platform/services/<svc>.yaml` with `vX.Y.Z+<svc>` (per-service Kargo `<svc>-config` Warehouse freight), then dispatches `service-config-tag` to platform-gitops so missing pointer files get seeded. |
+
+### Composite actions (`actions/`)
+
+| Action | Purpose |
+|---|---|
+| `discover-services` | Reads `.platform/services/*.yaml` and emits a docker matrix of services whose docker-relevant files changed since their last `image/<name>/*` tag. Also emits `charts_changed`. |
+
+## How to use
+
+Pin callers to `@main`. We own all consumers, so version pinning adds overhead without safety benefit at this team size — `@main` gives the "edit once, propagate everywhere" property that's the whole point of centralizing. If blast radius ever bites, we add a `@v1` tag selectively for the workflows that broke; we don't pre-tag everything.
+
+For workflows that touch secrets/OIDC, pin to an immutable SHA only if a security audit later requires it.
+
+### Caller `ci.yml` skeleton
+
+```yaml
+name: CI
+on:
+  push: { branches: [main] }
+  pull_request: { branches: [main] }
+  workflow_dispatch:
+    inputs:
+      services:
+        description: "Services to build: 'all' or comma-separated"
+        type: string
+        default: "all"
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      docker_matrix: ${{ steps.discover.outputs.docker_matrix }}
+      charts_changed: ${{ steps.discover.outputs.charts_changed }}
+    steps:
+      - uses: actions/checkout@v6
+        with: { fetch-depth: 0, fetch-tags: true }
+      - id: discover
+        uses: pinpredict/.github/actions/discover-services@main
+        with:
+          # Optional: extra source-pattern regex appended to every service's
+          # change-detection (matched against files since the service's last
+          # image tag). Use for shared code outside any single service.
+          shared-source-patterns: |
+            ^Dockerfile
+            ^PinPredict\.Shared/
+
+  # caller-owned language-specific test job here
+
+  docker-release:
+    needs: [detect, test]
+    if: needs.detect.outputs.docker_matrix != '{"include":[]}'
+    permissions: { id-token: write, contents: write }
+    uses: pinpredict/.github/.github/workflows/docker-release.yml@main
+    with:
+      matrix: ${{ needs.detect.outputs.docker_matrix }}
+    secrets: inherit
+
+  chart-release:
+    needs: detect
+    if: needs.detect.outputs.charts_changed == 'true'
+    permissions: { id-token: write, contents: write }
+    uses: pinpredict/.github/.github/workflows/chart-release.yml@main
+    secrets: inherit
+```
+
+And a thin `tag-config.yml`:
+
+```yaml
+name: Tag config
+on:
+  push:
+    branches: [main]
+    paths: ['.platform/services/*.yaml']
+  workflow_dispatch:
+    inputs:
+      service:
+        description: 'Service name to force-tag'
+        required: false
+        type: string
+
+jobs:
+  tag:
+    uses: pinpredict/.github/.github/workflows/tag-config.yml@main
+    secrets: inherit
+    with:
+      service: ${{ inputs.service || '' }}
+```
+
+## Org secrets consumed
+
+`tag-config.yml` mints a token via the existing `pinpredict-argocd` GitHub App (App ID 3187934 — the same App Kargo uses) to dispatch `service-config-tag` to platform-gitops. Required org secrets, scoped to `platform-gitops, trading, magellan, dis, replay`:
+
+- `BOOTSTRAP_APP_ID`
+- `BOOTSTRAP_APP_PRIVATE_KEY`
+
+Both are sourced from SSM (`/trading-platform-dev/config/argocd-github-app-{id,private-key}`). The App already has `Contents: write` on each consumer repo via Kargo, so no installation changes needed.
+
+## Service catalog convention
+
+`discover-services` and `chart-release.yml` both expect:
+
+- `.platform/services/<svc>.yaml` per service, with `.name`, `.repositories.image`, optional `.build.project` / `.build.dockerfile` / `.build.target` / `.build.sourcePaths[]`.
+- Per-service push role at `arn:aws:iam::784682930591:role/xp-<svc>-gha-push` (rendered by the platform-gitops Service XR composition).
+- `secrets.AWS_ROLE_ARN` as the fallback role for un-migrated charts/services.

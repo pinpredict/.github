@@ -1,0 +1,165 @@
+name: Tag config
+
+# Reusable workflow that tags merges to main touching `.platform/services/<svc>.yaml`
+# with `vX.Y.Z+<svc>` (one tag per changed service spec). The tag is the
+# freight identifier for each service's per-service Kargo `<svc>-config`
+# Warehouse — see env-pinned-service-specs design in platform-gitops.
+#
+# vX.Y.Z+<svc> uses semver BUILD METADATA (the `+` form), not the
+# pre-release identifier (`-` form). Build metadata:
+#   - is valid semver (strict + lenient parsing both accept it),
+#   - is ignored for version ordering and constraint checks (so the
+#     standard `semverConstraint: ">=0.0.0"` matches it cleanly — the
+#     pre-release form would require the awkward `>=0.0.0-0` suffix),
+#   - lets each service's Warehouse filter its own tags via
+#     `allowTagsRegexes` without inter-service interference.
+#
+# The workflow no-ops on a merge that doesn't touch any service spec.
+#
+# Caller is expected to trigger on `push` to main with a path filter on
+# `.platform/services/*.yaml` and pass the workflow_dispatch `service`
+# input through. See pinpredict/github-actions/README.md for the shim.
+
+on:
+  workflow_call:
+    inputs:
+      service:
+        description: "Service name to force-tag (workflow_dispatch only)"
+        required: false
+        type: string
+        default: ""
+    secrets:
+      BOOTSTRAP_APP_ID:
+        description: "App id for the shared pinpredict GitHub App. Used to mint a token that fires repository_dispatch into platform-gitops."
+        required: true
+      BOOTSTRAP_APP_PRIVATE_KEY:
+        description: "Private key for the shared pinpredict GitHub App."
+        required: true
+
+concurrency:
+  group: tag-config
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Determine changed services
+        id: changed
+        env:
+          FORCE_SERVICE: ${{ inputs.service }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "${FORCE_SERVICE}" ]; then
+            services="${FORCE_SERVICE}"
+          else
+            before='${{ github.event.before }}'
+            after='${{ github.sha }}'
+            if [ -z "$before" ] || [ "$before" = "0000000000000000000000000000000000000000" ]; then
+              before="${after}^"
+            fi
+            services=$(git diff --name-only "$before" "$after" -- '.platform/services/*.yaml' \
+              | sed -e 's|^\.platform/services/||' -e 's|\.yaml$||' \
+              | sort -u)
+          fi
+
+          if [ -z "$services" ]; then
+            echo "No service specs changed; nothing to tag."
+            echo "list=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Services to tag:"
+          echo "$services" | sed 's/^/  - /'
+          echo "list<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$services" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Compute and push tags
+        if: steps.changed.outputs.list != ''
+        run: |
+          set -euo pipefail
+
+          # One tag per changed service. Push each individually so a
+          # later push failure on one service doesn't poison the others.
+          while IFS= read -r svc; do
+            [ -n "$svc" ] || continue
+
+            latest=$(git tag --list "v*+${svc}" --sort=-v:refname \
+              | grep -E "^v[0-9]+\.[0-9]+\.[0-9]+\+${svc}$" | head -n1 || true)
+
+            if [ -z "$latest" ]; then
+              next="v0.0.1+${svc}"
+            else
+              version="${latest#v}"
+              version="${version%+${svc}}"
+              IFS='.' read -r major minor patch <<< "$version"
+              next="v${major}.${minor}.$((patch + 1))+${svc}"
+            fi
+
+            if git tag --list "$next" | grep -q .; then
+              echo "::error::Computed tag $next already exists — racing run?"
+              exit 1
+            fi
+
+            echo "Tagging ${GITHUB_SHA} as ${next}"
+            git tag "$next" "${GITHUB_SHA}"
+
+            pushed=false
+            for attempt in 1 2 3; do
+              if git push origin "$next"; then
+                echo "Pushed ${next}"
+                pushed=true
+                break
+              fi
+              echo "::warning::Push attempt ${attempt}/3 failed for ${next}"
+              sleep 2
+            done
+
+            if [ "$pushed" != true ]; then
+              echo "::error::Push failed after 3 attempts for ${next}"
+              exit 1
+            fi
+
+            # Record (svc, tag) so the next step can dispatch one
+            # repository_dispatch per tagged service to platform-gitops.
+            printf '%s %s\n' "$svc" "$next" >> "${RUNNER_TEMP}/dispatch.list"
+          done <<< "${{ steps.changed.outputs.list }}"
+
+      - name: Mint GitHub App token
+        if: steps.changed.outputs.list != ''
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.BOOTSTRAP_APP_ID }}
+          private-key: ${{ secrets.BOOTSTRAP_APP_PRIVATE_KEY }}
+          owner: pinpredict
+          repositories: platform-gitops
+
+      - name: Dispatch bootstrap-service-state to platform-gitops
+        # Triggers platform-gitops `.github/workflows/bootstrap-service-state.yaml`,
+        # which seeds any missing pointer files for each service's envs.
+        # See platform-gitops/docs/design/env-pinned-service-specs.md §"Bootstrap workflow".
+        if: steps.changed.outputs.list != ''
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          [ -f "${RUNNER_TEMP}/dispatch.list" ] || { echo "no tags pushed; nothing to dispatch"; exit 0; }
+          while IFS=' ' read -r svc tag; do
+            [ -n "$svc" ] || continue
+            echo "Dispatching service-config-tag for $svc ($tag)"
+            gh api -X POST repos/pinpredict/platform-gitops/dispatches \
+              -f event_type=service-config-tag \
+              -f "client_payload[service]=$svc" \
+              -f "client_payload[repo]=${{ github.repository }}" \
+              -f "client_payload[tag]=$tag"
+          done < "${RUNNER_TEMP}/dispatch.list"

@@ -1,0 +1,275 @@
+name: Discover services
+description: |
+  Reads .platform/services/*.yaml and emits a docker matrix of services whose
+  docker-relevant files changed since their last image/<name>/* git tag.
+  Also emits charts_changed and services_yaml_changed flags.
+
+  Outputs feed directly into pinpredict/github-actions/.github/workflows/docker-release.yml
+  and chart-release.yml.
+
+inputs:
+  shared-source-patterns:
+    description: |
+      Multiline list of regex patterns. If any of these match a file changed
+      since a service's last image tag, every service rebuilds (e.g. shared
+      libraries, root Dockerfile, solution file). One pattern per line.
+    required: false
+    default: ""
+  runtime-base:
+    description: |
+      Value passed as RUNTIME_BASE build-arg for every service. Default is
+      .NET 10 aspnet runtime; override for Go/other-language services
+      (e.g. "scratch" or "alpine:3.20"). Set to empty string to omit the
+      build-arg entirely.
+    required: false
+    default: "mcr.microsoft.com/dotnet/aspnet:10.0"
+  dev-account-id:
+    description: |
+      AWS account ID used to construct per-service push role ARN as
+      arn:aws:iam::<id>:role/xp-<svc>-gha-push. Defaults to the pinpredict
+      dev account (784682930591).
+    required: false
+    default: "784682930591"
+  dispatch-services:
+    description: |
+      Comma-separated services to build (or 'all'). Pass `${{ inputs.services }}`
+      from your workflow_dispatch trigger. Empty string for push/PR events.
+    required: false
+    default: ""
+
+outputs:
+  docker_matrix:
+    description: "JSON matrix in {include:[...]} shape for docker-release.yml"
+    value: ${{ steps.detect.outputs.docker_matrix }}
+  charts_changed:
+    description: "'true' if any charts/* file changed"
+    value: ${{ steps.detect.outputs.charts_changed }}
+  services_yaml_changed:
+    description: "'true' if any .platform/services/*.yaml file changed"
+    value: ${{ steps.detect.outputs.services_yaml_changed }}
+
+runs:
+  using: composite
+  steps:
+    - name: Discover service catalog and detect changes
+      id: detect
+      shell: bash
+      env:
+        SHARED_PATTERNS_INPUT: ${{ inputs.shared-source-patterns }}
+        RUNTIME_BASE: ${{ inputs.runtime-base }}
+        DEV_ACCOUNT_ID: ${{ inputs.dev-account-id }}
+        DISPATCH_SERVICES: ${{ inputs.dispatch-services }}
+        EVENT_NAME: ${{ github.event_name }}
+        PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        PUSH_BEFORE: ${{ github.event.before }}
+        PUSH_AFTER: ${{ github.sha }}
+      run: |
+        set -euo pipefail
+
+        # Service catalog is discovered from `.platform/services/*.yaml`.
+        # Each yaml's `repositories.image`, `repositories.chart`, and
+        # `build:` block (project + sourcePaths) populate one entry in
+        # SERVICE_DEFS — the same `|`-delimited tuple shape the rest of
+        # the step consumes, built at runtime instead of hand-maintained.
+        # Adding a new service is now: drop a yaml in `.platform/services/`
+        # and add a `charts/<name>/` dir. No CI edits.
+        #
+        # The per-service GHA push role follows the deterministic
+        # convention `arn:aws:iam::<dev-acct>:role/xp-<name>-gha-push`
+        # — the per-service Service XR composition creates it under
+        # that exact name (platform-gitops#524 / #526).
+
+        # Join shared-source-patterns multiline input into a single
+        # alternation regex. Empty input → empty regex (matches nothing).
+        SHARED_PATTERNS=$(echo "${SHARED_PATTERNS_INPUT}" \
+          | awk 'NF' \
+          | paste -sd'|' -)
+
+        # yq is pre-installed on ubuntu-latest runners (mikefarah/yq).
+        # For each service yaml, emit one line:
+        #   name|ecr_repo|dockerfile|target|build_args|source_pattern_regex
+        declare -a SERVICE_DEFS=()
+        while IFS= read -r svc_yaml; do
+          name=$(yq -r '.name' "$svc_yaml")
+          ecr=$(yq -r '.repositories.image' "$svc_yaml")
+          project=$(yq -r '.build.project // ""' "$svc_yaml")
+          dockerfile=$(yq -r '.build.dockerfile // "Dockerfile"' "$svc_yaml")
+          target=$(yq -r '.build.target // "production"' "$svc_yaml")
+          if [ "$name" = "null" ] || [ "$ecr" = "null" ]; then
+            echo "::warning::skipping $svc_yaml — missing name or repositories.image"
+            continue
+          fi
+          # Join sourcePaths[] with `|` — that's the same delimiter the
+          # per-service-tuple parser uses below, so the patterns tail of
+          # the tuple is opaque to the splitter.
+          source_patterns=$(yq -r '.build.sourcePaths // [] | join("|")' "$svc_yaml")
+
+          # build_args composition: PROJECT only present when build.project
+          # is set; RUNTIME_BASE only present when the action input is
+          # non-empty. Services with neither (e.g. Go services where the
+          # Dockerfile needs no build-args) end up with build_args="".
+          build_args=""
+          if [ -n "$project" ]; then
+            build_args="PROJECT=${project}"
+          fi
+          if [ -n "${RUNTIME_BASE}" ]; then
+            if [ -n "$build_args" ]; then
+              build_args="${build_args},RUNTIME_BASE=${RUNTIME_BASE}"
+            else
+              build_args="RUNTIME_BASE=${RUNTIME_BASE}"
+            fi
+          fi
+
+          SERVICE_DEFS+=("${name}|${ecr}|${dockerfile}|${target}|${build_args}|${source_patterns}")
+        done < <(find .platform/services -maxdepth 1 -name '*.yaml' ! -name '.schema*' -print 2>/dev/null | sort)
+
+        if [ ${#SERVICE_DEFS[@]} -eq 0 ]; then
+          echo "::warning::No services discovered under .platform/services/*.yaml"
+          echo "docker_matrix={\"include\":[]}" >> "$GITHUB_OUTPUT"
+          echo "charts_changed=false" >> "$GITHUB_OUTPUT"
+          echo "services_yaml_changed=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        echo "Discovered ${#SERVICE_DEFS[@]} services:"
+        printf '  %s\n' "${SERVICE_DEFS[@]}"
+
+        per_service_role() {
+          echo "arn:aws:iam::${DEV_ACCOUNT_ID}:role/xp-$1-gha-push"
+        }
+
+        # Convert "K=V,K=V" build_args into "K=V\nK=V" for the matrix entry.
+        json_entry() {
+          local name=$1 ecr=$2 dockerfile=$3 target=$4 build_args=$5
+          local nl_args=""
+          if [ -n "$build_args" ]; then
+            nl_args=$(echo "$build_args" | sed 's/,/\\n/g')
+          fi
+          local role
+          role=$(per_service_role "$name")
+          printf '{"name":"%s","ecr_repo":"%s","dockerfile":"%s","target":"%s","build_args":"%s","role":"%s"}' \
+            "$name" "$ecr" "$dockerfile" "$target" "$nl_args" "$role"
+        }
+
+        # workflow_dispatch path: build the requested services (or all).
+        # No diff comparison — operator explicitly opted in.
+        if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+          requested="${DISPATCH_SERVICES:-all}"
+
+          entries=()
+          for def in "${SERVICE_DEFS[@]}"; do
+            IFS='|' read -r name ecr dockerfile target build_args _patterns <<< "$def"
+            if [ "$requested" = "all" ] || echo ",${requested}," | grep -q ",${name},"; then
+              entries+=("$(json_entry "$name" "$ecr" "$dockerfile" "$target" "$build_args")")
+            fi
+          done
+          if [ ${#entries[@]} -eq 0 ]; then
+            echo "::error::No matching services for input '${requested}'"
+            exit 1
+          fi
+          json="{\"include\":[$(IFS=,; echo "${entries[*]}")]}"
+          echo "docker_matrix=${json}" >> "$GITHUB_OUTPUT"
+          echo "charts_changed=true" >> "$GITHUB_OUTPUT"
+          echo "services_yaml_changed=false" >> "$GITHUB_OUTPUT"
+          echo "Manual dispatch (services=${requested}): matrix=${json}"
+          exit 0
+        fi
+
+        # Diff the appropriate ref range.
+        if [ "$EVENT_NAME" = "pull_request" ]; then
+          changed=$(git diff --name-only "${PR_BASE_SHA}..${PR_HEAD_SHA}")
+        else
+          if [ -z "$PUSH_BEFORE" ] || [ "$PUSH_BEFORE" = "0000000000000000000000000000000000000000" ]; then
+            # First push to a new repo: compare against parent of HEAD.
+            changed=$(git diff --name-only "${PUSH_AFTER}^..${PUSH_AFTER}" 2>/dev/null || git ls-tree -r --name-only HEAD)
+          else
+            changed=$(git diff --name-only "${PUSH_BEFORE}..${PUSH_AFTER}")
+          fi
+        fi
+
+        echo "Changed files:"
+        echo "$changed"
+
+        charts_changed=false
+        services_yaml_changed=false
+        while IFS= read -r file; do
+          [ -z "$file" ] && continue
+          case "$file" in
+            charts/*) charts_changed=true ;;
+            .platform/services/*.yaml) services_yaml_changed=true ;;
+          esac
+        done <<< "$changed"
+
+        echo "charts_changed=${charts_changed}" >> "$GITHUB_OUTPUT"
+        echo "services_yaml_changed=${services_yaml_changed}" >> "$GITHUB_OUTPUT"
+
+        # Per-service docker matrix detection (only on push to main).
+        # PRs never trigger image builds — too noisy and wastes ECR quota.
+        docker_matrix='{"include":[]}'
+        if [ "$EVENT_NAME" = "push" ]; then
+          # The repo's .dockerignore drives which paths actually affect
+          # the image. We invert it: `!` lines are the allow-list; anything
+          # matching becomes a candidate for "docker-relevant change".
+          if [ -f .dockerignore ]; then
+            includes=$(grep '^!' .dockerignore | sed 's|^!||; s|[.]|\\.|g; s|/$|/.*|; s|\*|.*|g')
+          else
+            includes=""
+          fi
+
+          entries=()
+          for def in "${SERVICE_DEFS[@]}"; do
+            IFS='|' read -r name ecr dockerfile target build_args source_patterns <<< "$def"
+
+            latest_tag=$(git tag --list "image/${name}/*" --sort=-v:refname \
+              | grep -E "^image/${name}/[0-9]+\.[0-9]+\.[0-9]+$" | head -n1)
+
+            if [ -z "$latest_tag" ]; then
+              echo "${name}: no previous tags — first release"
+              entries+=("$(json_entry "$name" "$ecr" "$dockerfile" "$target" "$build_args")")
+              continue
+            fi
+
+            if [ -n "$includes" ]; then
+              docker_changed=$(git diff --name-only "${latest_tag}..HEAD" \
+                | grep -E "^($(echo "$includes" | paste -sd'|' -))" || true)
+            else
+              # No .dockerignore allow-list — treat everything as docker-relevant.
+              docker_changed=$(git diff --name-only "${latest_tag}..HEAD")
+            fi
+
+            [ -z "$docker_changed" ] && { echo "${name}: no docker-relevant changes — skipping"; continue; }
+
+            should_build=false
+            if [ -n "$SHARED_PATTERNS" ] && echo "$docker_changed" | grep -qE "$SHARED_PATTERNS"; then
+              should_build=true
+            fi
+
+            if [ -n "$source_patterns" ]; then
+              IFS='|' read -ra patterns <<< "$source_patterns"
+              for pattern in "${patterns[@]}"; do
+                if echo "$docker_changed" | grep -qE "$pattern"; then
+                  should_build=true
+                fi
+              done
+            else
+              # No per-service sourcePaths declared — any docker-relevant
+              # change in this repo triggers a build for the service.
+              # (Suits single-service repos like service-template.)
+              should_build=true
+            fi
+
+            if [ "$should_build" = true ]; then
+              echo "${name}: relevant changes — building"
+              entries+=("$(json_entry "$name" "$ecr" "$dockerfile" "$target" "$build_args")")
+            else
+              echo "${name}: changes don't match this service — skipping"
+            fi
+          done
+
+          if [ ${#entries[@]} -gt 0 ]; then
+            docker_matrix="{\"include\":[$(IFS=,; echo "${entries[*]}")]}"
+          fi
+        fi
+        echo "docker_matrix=${docker_matrix}" >> "$GITHUB_OUTPUT"
+        echo "Matrix: ${docker_matrix}"
