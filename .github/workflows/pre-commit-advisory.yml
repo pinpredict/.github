@@ -21,9 +21,33 @@ on:
   workflow_call:
     inputs:
       python-version:
-        description: "Python version used to run pre-commit (the hooks themselves use their own languages)."
+        description: "Python version used to run pre-commit. The hooks themselves use their own languages (see setup-dotnet, setup-node-pnpm)."
         type: string
         default: "3.13"
+      setup-dotnet:
+        description: |
+          When true, install .NET SDK + `dotnet tool restore` before running
+          pre-commit. Required when the repo has hooks that invoke `dotnet`
+          tools (e.g. csharpier). .NET SDK itself is cached by setup-dotnet
+          across runs; tool restore reads `.config/dotnet-tools.json`.
+        type: boolean
+        default: false
+      dotnet-version:
+        description: ".NET SDK version. Ignored when setup-dotnet=false."
+        type: string
+        default: "10.0.x"
+      setup-node-pnpm:
+        description: |
+          When true, enable corepack + install Node + `pnpm install --frozen-lockfile`
+          before running pre-commit. Required when the repo has hooks that
+          invoke pnpm/node binaries (e.g. ui-eslint, ui-prettier). Node and
+          pnpm store are cached by setup-node + setup-uv across runs.
+        type: boolean
+        default: false
+      node-version:
+        description: "Node version. Ignored when setup-node-pnpm=false."
+        type: string
+        default: "24"
 
 permissions:
   contents: read
@@ -45,7 +69,7 @@ jobs:
         with:
           python-version: ${{ inputs.python-version }}
 
-      - name: Cache pre-commit envs
+      - name: Cache pre-commit hook envs
         uses: actions/cache@v4
         with:
           path: ~/.cache/pre-commit
@@ -55,6 +79,51 @@ jobs:
 
       - name: Install pre-commit
         run: pip install --upgrade pip pre-commit
+
+      # Optional: install .NET SDK + restore local tools (csharpier, etc).
+      # setup-dotnet@v5 caches the SDK by version across runs.
+      - name: Set up .NET
+        if: inputs.setup-dotnet
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: ${{ inputs.dotnet-version }}
+
+      # Cache the dotnet tool install directory keyed on the tools manifest.
+      # ~/.dotnet/tools is tiny but the install (`dotnet tool restore`)
+      # downloads csharpier + any other tools; cache makes it a no-op on
+      # warm runs.
+      - name: Cache dotnet tools
+        if: inputs.setup-dotnet
+        uses: actions/cache@v4
+        with:
+          path: ~/.dotnet/tools
+          key: dotnet-tools-${{ runner.os }}-${{ hashFiles('**/dotnet-tools.json') }}
+          restore-keys: |
+            dotnet-tools-${{ runner.os }}-
+
+      - name: Restore .NET tools
+        if: inputs.setup-dotnet
+        run: dotnet tool restore
+
+      # Optional: install Node + enable pnpm + install workspace deps.
+      # setup-node@v4 with cache:pnpm caches the pnpm content-addressable
+      # store across runs, so `pnpm install --frozen-lockfile` is mostly
+      # a symlink-create after the first run (5-10s typical).
+      - name: Enable corepack (pnpm)
+        if: inputs.setup-node-pnpm
+        run: corepack enable
+
+      - name: Set up Node.js
+        if: inputs.setup-node-pnpm
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Install Node workspace deps
+        if: inputs.setup-node-pnpm
+        run: pnpm install --frozen-lockfile
 
       - name: Run pre-commit on PR diff
         id: precommit
