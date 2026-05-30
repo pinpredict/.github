@@ -31,9 +31,9 @@ inputs:
     required: false
     default: "784682930591"
   dispatch-services:
-    description: |
-      Comma-separated services to build (or 'all'). Pass `${{ inputs.services }}`
-      from your workflow_dispatch trigger. Empty string for push/PR events.
+    description: >-
+      Comma-separated services to build (or 'all'). Pass the caller's
+      workflow_dispatch services input here; empty string for push/PR events.
     required: false
     default: ""
 
