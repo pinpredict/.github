@@ -1,10 +1,17 @@
 name: Pre-commit (advisory)
 
 # Non-blocking pre-commit run that surfaces what the repo's local
-# pre-commit hooks would flag on this PR's diff. Posts (or updates) a
-# sticky PR comment with the output, and fails the job on hook failure
-# so engineers see a ❌ check — but this workflow is NOT required for
-# merge in any repo's branch protection, so it never blocks.
+# pre-commit hooks would flag on this PR's diff. On failure it posts (or
+# updates) a sticky PR comment with the output; on a clean diff it stays
+# silent (and clears any prior failure comment back to ✅). Either way it
+# fails the job on hook failure so engineers see a ❌ check — but this
+# workflow is NOT required for merge in any repo's branch protection, so
+# it never blocks.
+#
+# Why silent-on-success: the bot's only email is the *creation* of a PR
+# comment (GitHub doesn't email on edits). Posting a ✅ comment on every
+# clean PR emailed every author for a no-op. Commenting only on failure
+# keeps clean PRs email-free while still surfacing real violations.
 #
 # Why advisory and not required: org-wide pre-commit configs accumulate
 # over time, and existing repos carry pre-existing violations. Forcing
@@ -192,7 +199,18 @@ jobs:
           comment-author: github-actions[bot]
           body-includes: <!-- pre-commit-advisory -->
 
+      # Comment only when there's something to say or to clear:
+      #   - failure (exit_code != 0): create/update the ⚠️ comment. The
+      #     first create on a given PR emails its author; later updates
+      #     (edits) don't, so a PR is at most one email from this bot.
+      #   - success with an EXISTING comment: edit it back to ✅ so a
+      #     fixed PR doesn't keep a stale ⚠️. An edit, so no email.
+      #   - success with NO existing comment (the common clean-PR case):
+      #     skip entirely — no comment, no email, no inbox noise.
+      # Without the comment-id guard on the success branch, create-or-update
+      # would *create* a ✅ comment on every clean PR and email the author.
       - name: Post or update PR comment
+        if: steps.precommit.outputs.exit_code != '0' || steps.find.outputs.comment-id != ''
         uses: peter-evans/create-or-update-comment@v4
         with:
           comment-id: ${{ steps.find.outputs.comment-id }}
