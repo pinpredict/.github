@@ -178,6 +178,12 @@ jobs:
             -t "${ECR_REGISTRY}/${ECR_REPO}:${version}"
             -t "${ECR_REGISTRY}/${ECR_REPO}:${version}-${SHORT_SHA}"
             -f "${DOCKERFILE}"
+            # Stamp the resolved version into the build so images can
+            # surface what they actually are at runtime (e.g. Vite-baked
+            # `VITE_APP_VERSION` for SPA bundles, /api/version fallback
+            # for backend services). Dockerfiles that don't declare
+            # `ARG APP_VERSION` silently ignore it.
+            --build-arg "APP_VERSION=${version}"
           )
           if [ -n "${TARGET}" ]; then
             buildx_args+=(--target "${TARGET}")
