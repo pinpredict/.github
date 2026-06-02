@@ -94,12 +94,27 @@ runs:
         while IFS= read -r svc_yaml; do
           name=$(yq -r '.name' "$svc_yaml")
           ecr=$(yq -r '.repositories.image' "$svc_yaml")
+          chart=$(yq -r '.repositories.chart // ""' "$svc_yaml")
           project=$(yq -r '.build.project // ""' "$svc_yaml")
           dockerfile=$(yq -r '.build.dockerfile // "Dockerfile"' "$svc_yaml")
           target=$(yq -r '.build.target // "production"' "$svc_yaml")
           if [ "$name" = "null" ] || [ "$ecr" = "null" ]; then
             echo "::warning::skipping $svc_yaml — missing name or repositories.image"
             continue
+          fi
+
+          # Validate repositories.chart resolves to a real sibling chart dir
+          # with its own Chart.yaml. chart-release.yml discovers charts via
+          # `charts/*/Chart.yaml`; an inline sub-deployment under another
+          # umbrella (extra template files under charts/<umbrella>/templates/)
+          # is NOT published, and the umbrella's image fallback then resolves
+          # the pod to `<svc>:0.0.<short-sha>` → ImagePullBackOff. See
+          # dis#123/#128 + platform-gitops#538 for the incident.
+          if [ -n "$chart" ] && [ "$chart" != "null" ]; then
+            if [ ! -f "${chart}/Chart.yaml" ]; then
+              BUILD_ERRORS+=("${name} (${svc_yaml}): declared repositories.chart '${chart}' has no ${chart}/Chart.yaml — chart-release.yml only publishes sibling charts under charts/*/Chart.yaml, not inline sub-deployments")
+              continue
+            fi
           fi
 
           # Validate the resolved (dockerfile, target) pair against disk

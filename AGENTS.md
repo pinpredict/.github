@@ -24,7 +24,7 @@ There is no build, lint, or test step in this repo. Validate changes by running 
 - `name`, `repositories.image`, `repositories.chart`
 - `build.project`, `build.dockerfile` (default `Dockerfile`), `build.target` (default `production`), `build.sourcePaths[]`
 
-`discover-services` **validates `build.dockerfile` exists on disk and `build.target` is a real `FROM ... AS <target>` stage** before emitting the matrix — this catches multi-Dockerfile repos (trader-tools) where the silent default would build the wrong artifact. See the trader-tools#482 / pinpredict/.github#5 incident comments in `actions/discover-services/action.yml`.
+`discover-services` **validates `build.dockerfile` exists on disk, `build.target` is a real `FROM ... AS <target>` stage, and `repositories.chart` resolves to a sibling `charts/<x>/Chart.yaml`** before emitting the matrix. The dockerfile/target checks catch multi-Dockerfile repos (trader-tools) where the silent default would build the wrong artifact (trader-tools#482 / pinpredict/.github#5). The chart check catches inline-sub-deployment shortcuts that chart-release's `charts/*/Chart.yaml` discovery silently skips, leading to `ImagePullBackOff` when the umbrella's image fallback resolves (dis#123/#128 / platform-gitops#538).
 
 ### Per-service IAM push role naming
 
