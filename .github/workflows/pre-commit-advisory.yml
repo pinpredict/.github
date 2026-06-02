@@ -56,10 +56,16 @@ permissions:
 jobs:
   advisory:
     runs-on: ubuntu-latest
-    # Only meaningful on PRs — on push, the diff base is ambiguous and
-    # the value (already-merged code) is lower. Callers can still invoke
-    # this on push if they want; the job will skip cleanly.
-    if: github.event_name == 'pull_request'
+    # Runs on pull_request (the advisory check itself) AND on push to
+    # the default branch (cache-seed only — installs hook envs into
+    # ~/.cache/pre-commit so PR branches can restore them).
+    #
+    # Why the push-to-main run matters: GitHub Actions caches are
+    # scoped per branch. A PR branch can only restore caches from its
+    # own branch or the repo's default branch. Without a push-to-main
+    # run, the default-branch scope is never populated, so every new
+    # PR branch rebuilds hook envs from scratch on its first run.
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
     steps:
       - uses: actions/checkout@v6
         with:
@@ -125,7 +131,17 @@ jobs:
         if: inputs.setup-node-pnpm
         run: pnpm install --frozen-lockfile
 
+      # Push-to-default-branch runs exist only to populate
+      # ~/.cache/pre-commit (and ~/.dotnet/tools / pnpm store) into
+      # the default-branch cache scope so PR branches can restore
+      # them. install-hooks downloads + builds every hook env without
+      # executing any hook, so we don't replay org-wide debt on main.
+      - name: Install pre-commit hook envs (cache seed)
+        if: github.event_name == 'push'
+        run: pre-commit install-hooks
+
       - name: Run pre-commit on PR diff
+        if: github.event_name == 'pull_request'
         id: precommit
         continue-on-error: true
         env:
@@ -145,6 +161,7 @@ jobs:
           echo "exit_code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
 
       - name: Build PR comment body
+        if: github.event_name == 'pull_request'
         id: body
         env:
           EXIT_CODE: ${{ steps.precommit.outputs.exit_code }}
@@ -185,6 +202,7 @@ jobs:
           echo "path=/tmp/body.md" >> "$GITHUB_OUTPUT"
 
       - name: Find existing advisory comment
+        if: github.event_name == 'pull_request'
         id: find
         uses: peter-evans/find-comment@v3
         with:
@@ -193,6 +211,7 @@ jobs:
           body-includes: <!-- pre-commit-advisory -->
 
       - name: Post or update PR comment
+        if: github.event_name == 'pull_request'
         uses: peter-evans/create-or-update-comment@v4
         with:
           comment-id: ${{ steps.find.outputs.comment-id }}
@@ -201,7 +220,7 @@ jobs:
           edit-mode: replace
 
       - name: Reflect pre-commit exit code as the job's status
-        if: steps.precommit.outputs.exit_code != '0'
+        if: github.event_name == 'pull_request' && steps.precommit.outputs.exit_code != '0'
         run: |
           echo "::error::pre-commit found issues on this PR's diff. See the sticky PR comment and the run log."
           exit 1
