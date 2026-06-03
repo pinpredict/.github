@@ -196,10 +196,24 @@ runs:
           # Render once per env in `environments[]`. ApplicationSets
           # set exactly one renderXxx flag at a time in production;
           # forcing them all on here is louder but exercises every
-          # template path (Application + Kargo Stage + Warehouse +
-          # PodIdentity + NetworkPolicy + ECR claim + ExternalSecret)
-          # against this engineer yaml's actual values. The values
-          # schema validation runs as a side effect of `helm template`.
+          # template path (Application + Kargo + PodIdentity +
+          # NetworkPolicy + ECR claim + ExternalSecret + apiNlb +
+          # rds-provisioner) against this engineer yaml's actual
+          # values. The values schema validation runs as a side
+          # effect of `helm template`.
+          #
+          # `renderApiNlb` and `renderRdsProvisioner` are only
+          # *effective* when the engineer yaml opts in (the helper
+          # gates check for an `apiNlb:` block / `rds.grants:` list
+          # respectively), so forcing them true is a no-op for
+          # services that don't use those blocks. For services that
+          # do, this catches template-side `required` calls
+          # (privateSubnets, rds.dbUser, rdsEndpoint) — the schema
+          # doesn't enforce those because they're only conditionally
+          # required, but the chart does. Inject realistic-looking
+          # placeholders for the ApplicationSet-supplied values so
+          # the only way the template fails is if the engineer-yaml
+          # is incomplete.
           envs=$(yq -r '.environments[]' "$yaml")
           if [ -z "$envs" ]; then
             echo "::error file=$yaml::environments[] is empty"
@@ -222,12 +236,16 @@ runs:
                 --set-string renderNetworkPolicy=true \
                 --set-string renderECR=true \
                 --set-string renderExternalSecret=true \
+                --set-string renderApiNlb=true \
+                --set-string renderRdsProvisioner=true \
                 --set-string ecrAccountId="$ECR_ACCOUNT_ID" \
                 --set-string region=us-east-1 \
                 --set-string gitopsRepoUrl=https://github.com/pinpredict/platform-gitops \
                 --set-string dataServicesIrsaArn="arn:aws:iam::${ECR_ACCOUNT_ID}:role/data-services-placeholder" \
                 --set-string githubRepo="$REPO_FULL" \
                 --set-string tier=staging \
+                --set-string privateSubnets="subnet-validate-placeholder" \
+                --set-string rdsEndpoint="validate-placeholder.rds.amazonaws.com" \
                 > /tmp/render.out 2> /tmp/render.err; then
               echo "::error file=$yaml::helm template failed for env=$env"
               echo "--- stderr ---"
