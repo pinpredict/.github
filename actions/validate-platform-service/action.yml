@@ -1,0 +1,237 @@
+name: Validate platform service yaml
+description: |
+  Pre-merge static + render check for new or modified
+  `.platform/services/<svc>.yaml` files in a consumer repo.
+
+  Closes the gap surfaced by platform-gitops#544: every failure mode
+  during dis-opticodds-props-streamer onboarding (chart layout
+  mismatch, silent helper fallback, missing pointer files, 0.0.0
+  ComparisonError) only surfaced *after* PR merge to stg. This action
+  runs the same render service-template will run post-merge, so the
+  same failures fail CI instead.
+
+  Checks performed, per engineer-yaml:
+
+    1. JSON-schema validation (via service-template's values.schema.json,
+       enforced automatically by `helm template`).
+    2. `helm template` succeeds for each env in `environments[]` with
+       every render flag forced on (renderApp, renderKargo,
+       renderPodIdentity, renderNetworkPolicy, renderECR,
+       renderExternalSecret) — exercises every template path the
+       five workload-cluster ApplicationSets will hit.
+    3. `repositories.chart` resolves to a sibling `charts/<x>/Chart.yaml`
+       in the consumer repo (when the field is set).
+
+  ECR repo and PIA TF cross-references are intentionally NOT checked:
+  per platform-gitops PR #229 / RFC #482, those are now Crossplane
+  managed resources rendered by service-template itself from the
+  engineer yaml. If service-template renders, the claims will be
+  emitted correctly when Argo applies them.
+
+inputs:
+  services-yaml-paths:
+    description: |
+      Multiline list of `.platform/services/<svc>.yaml` paths to
+      validate. Empty (default) means auto-detect from the PR diff
+      (added or modified yamls under `.platform/services/`).
+    required: false
+    default: ""
+  service-template-ref:
+    description: |
+      Git ref in `pinpredict/platform-gitops` to pull
+      `charts/service-template/` from. Defaults to `main`. Override
+      to a branch/SHA when validating against an in-flight chart
+      change.
+    required: false
+    default: "main"
+  ecr-account-id:
+    description: |
+      AWS account ID for the ECR registry — used to populate the
+      `ecrAccountId` helm value so the rendered Application points
+      at a realistic registry. Default is the pinpredict dev
+      account (784682930591). Render is hermetic; nothing actually
+      contacts AWS.
+    required: false
+    default: "784682930591"
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve services to validate
+      id: resolve
+      shell: bash
+      env:
+        EXPLICIT_PATHS: ${{ inputs.services-yaml-paths }}
+        EVENT_NAME: ${{ github.event_name }}
+        PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      run: |
+        set -euo pipefail
+
+        # Explicit paths win when provided — useful for manual
+        # workflow_dispatch revalidation. Otherwise auto-detect from
+        # the PR diff using three-dot range (BASE...HEAD = changes
+        # introduced by this branch relative to the merge-base), which
+        # matches GitHub's "Files changed" tab and avoids false
+        # positives from intervening main commits.
+        if [ -n "${EXPLICIT_PATHS//[[:space:]]/}" ]; then
+          echo "Using explicit services-yaml-paths input"
+          paths=$(echo "$EXPLICIT_PATHS" | awk 'NF')
+        elif [ "$EVENT_NAME" = "pull_request" ]; then
+          echo "Auto-detecting changed .platform/services/*.yaml from PR diff"
+          paths=$(git diff --name-only --diff-filter=AM \
+            "${PR_BASE_SHA}...${PR_HEAD_SHA}" -- '.platform/services/*.yaml' \
+            || true)
+        else
+          # Push / dispatch: validate every yaml so the workflow is
+          # also useful as a periodic sanity check on main.
+          paths=$(ls .platform/services/*.yaml 2>/dev/null || true)
+        fi
+
+        if [ -z "$paths" ]; then
+          echo "No .platform/services/*.yaml files to validate."
+          echo "any=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        echo "Will validate:"
+        printf '  %s\n' $paths
+        # GH multiline output
+        {
+          echo "paths<<EOF"
+          echo "$paths"
+          echo "EOF"
+        } >> "$GITHUB_OUTPUT"
+        echo "any=true" >> "$GITHUB_OUTPUT"
+
+    - name: Fetch service-template chart
+      if: steps.resolve.outputs.any == 'true'
+      shell: bash
+      env:
+        REF: ${{ inputs.service-template-ref }}
+      run: |
+        set -euo pipefail
+        # Sparse-checkout of platform-gitops avoids OIDC + ECR-pull
+        # plumbing for a chart that lives in a public-to-us git repo.
+        # `--filter=blob:none --sparse` keeps the clone small (~2s
+        # vs ~30s for a full clone of platform-gitops).
+        tmp=$(mktemp -d)
+        git clone --depth=1 --filter=blob:none --sparse \
+          --branch "$REF" \
+          https://github.com/pinpredict/platform-gitops.git \
+          "$tmp/pg"
+        git -C "$tmp/pg" sparse-checkout set charts/service-template
+        echo "SERVICE_TEMPLATE_DIR=$tmp/pg/charts/service-template" >> "$GITHUB_ENV"
+
+    - name: Install Helm + yq
+      if: steps.resolve.outputs.any == 'true'
+      uses: azure/setup-helm@v5
+
+    - name: Validate each engineer yaml
+      if: steps.resolve.outputs.any == 'true'
+      shell: bash
+      env:
+        PATHS: ${{ steps.resolve.outputs.paths }}
+        ECR_ACCOUNT_ID: ${{ inputs.ecr-account-id }}
+        REPO_FULL: ${{ github.repository }}
+      run: |
+        set -euo pipefail
+
+        # yq is pre-installed on ubuntu-latest GitHub-hosted runners
+        # (mikefarah/yq). On self-hosted that's not guaranteed —
+        # install if missing.
+        if ! command -v yq >/dev/null 2>&1; then
+          sudo curl -fsSL -o /usr/local/bin/yq \
+            https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+        fi
+
+        fail=0
+        while IFS= read -r yaml; do
+          [ -z "$yaml" ] && continue
+          echo
+          echo "=== $yaml ==="
+
+          if [ ! -f "$yaml" ]; then
+            echo "::error file=$yaml::file not found"
+            fail=1; continue
+          fi
+
+          name=$(yq -r '.name // ""' "$yaml")
+          if [ -z "$name" ]; then
+            echo "::error file=$yaml::missing required field: name"
+            fail=1; continue
+          fi
+
+          # repositories.chart points at a chart dir in the consumer
+          # repo (or omitted for chart-less services). When set, the
+          # path must resolve to a real Chart.yaml — this is the
+          # exact check that, when missing, caused dis #123's
+          # ImagePullBackOff via the umbrella's silent image fallback.
+          chart_repo=$(yq -r '.repositories.chart // ""' "$yaml")
+          if [ -n "$chart_repo" ]; then
+            # repositories.chart is the ECR path (e.g.
+            # charts/dis-opticodds-props-streamer); the corresponding
+            # source-of-truth chart dir is charts/<basename>/.
+            chart_dir="charts/$(basename "$chart_repo")"
+            if [ ! -f "${chart_dir}/Chart.yaml" ]; then
+              echo "::error file=$yaml::repositories.chart=${chart_repo} but no ${chart_dir}/Chart.yaml found in this repo"
+              fail=1; continue
+            fi
+            echo "✓ chart dir ${chart_dir} resolves"
+          fi
+
+          # Render once per env in `environments[]`. ApplicationSets
+          # set exactly one renderXxx flag at a time in production;
+          # forcing them all on here is louder but exercises every
+          # template path (Application + Kargo Stage + Warehouse +
+          # PodIdentity + NetworkPolicy + ECR claim + ExternalSecret)
+          # against this engineer yaml's actual values. The values
+          # schema validation runs as a side effect of `helm template`.
+          envs=$(yq -r '.environments[]' "$yaml")
+          if [ -z "$envs" ]; then
+            echo "::error file=$yaml::environments[] is empty"
+            fail=1; continue
+          fi
+
+          for env in $envs; do
+            echo "  rendering env=$env"
+            # Use --set-string for the renderXxx flags and ecrAccountId:
+            # the chart's values.schema.json types them as strings to
+            # mirror how ApplicationSets pass them (`helm.parameters`
+            # stringifies everything). Booleans here would fail
+            # schema validation despite "looking right".
+            if ! helm template "$name" "$SERVICE_TEMPLATE_DIR" \
+                -f "$yaml" \
+                --set-string env="$env" \
+                --set-string renderApp=true \
+                --set-string renderKargo=true \
+                --set-string renderPodIdentity=true \
+                --set-string renderNetworkPolicy=true \
+                --set-string renderECR=true \
+                --set-string renderExternalSecret=true \
+                --set-string ecrAccountId="$ECR_ACCOUNT_ID" \
+                --set-string region=us-east-1 \
+                --set-string gitopsRepoUrl=https://github.com/pinpredict/platform-gitops \
+                --set-string dataServicesIrsaArn="arn:aws:iam::${ECR_ACCOUNT_ID}:role/data-services-placeholder" \
+                --set-string githubRepo="$REPO_FULL" \
+                --set-string tier=staging \
+                > /tmp/render.out 2> /tmp/render.err; then
+              echo "::error file=$yaml::helm template failed for env=$env"
+              echo "--- stderr ---"
+              cat /tmp/render.err
+              fail=1
+              continue
+            fi
+            echo "  ✓ env=$env rendered ($(wc -l < /tmp/render.out) lines)"
+          done
+        done <<< "$PATHS"
+
+        if [ "$fail" -ne 0 ]; then
+          echo
+          echo "::error::One or more .platform/services/*.yaml validations failed"
+          exit 1
+        fi
+
+        echo
+        echo "All engineer yamls validated."
