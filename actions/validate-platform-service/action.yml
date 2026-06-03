@@ -54,13 +54,13 @@ inputs:
     required: false
     default: "784682930591"
   github-token:
-    description: |
+    description: >
       Token used to clone `pinpredict/platform-gitops` (private repo)
       to fetch `charts/service-template`. The caller must mint this
       with read access to platform-gitops — typically via
       `actions/create-github-app-token` against the `pinpredict-argocd`
-      App (org secrets `BOOTSTRAP_APP_ID` + `BOOTSTRAP_APP_PRIVATE_KEY`,
-      scoped to every consumer repo). The default `${{ github.token }}`
+      App (org secrets BOOTSTRAP_APP_ID + BOOTSTRAP_APP_PRIVATE_KEY,
+      scoped to every consumer repo). A plain workflow `github.token`
       will NOT work — it only authenticates against the calling repo.
     required: true
 
