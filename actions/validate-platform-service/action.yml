@@ -53,6 +53,16 @@ inputs:
       contacts AWS.
     required: false
     default: "784682930591"
+  github-token:
+    description: |
+      Token used to clone `pinpredict/platform-gitops` (private repo)
+      to fetch `charts/service-template`. The caller must mint this
+      with read access to platform-gitops — typically via
+      `actions/create-github-app-token` against the `pinpredict-argocd`
+      App (org secrets `BOOTSTRAP_APP_ID` + `BOOTSTRAP_APP_PRIVATE_KEY`,
+      scoped to every consumer repo). The default `${{ github.token }}`
+      will NOT work — it only authenticates against the calling repo.
+    required: true
 
 runs:
   using: composite
@@ -106,22 +116,24 @@ runs:
 
     - name: Fetch service-template chart
       if: steps.resolve.outputs.any == 'true'
+      uses: actions/checkout@v6
+      with:
+        # platform-gitops is private; the caller-supplied app token
+        # is the only way to read it from a consumer-repo workflow
+        # (`${{ github.token }}` is scoped to the calling repo only).
+        repository: pinpredict/platform-gitops
+        ref: ${{ inputs.service-template-ref }}
+        token: ${{ inputs.github-token }}
+        path: .validate-service-template-pg
+        sparse-checkout: charts/service-template
+        sparse-checkout-cone-mode: false
+
+    - name: Export service-template path
+      if: steps.resolve.outputs.any == 'true'
       shell: bash
-      env:
-        REF: ${{ inputs.service-template-ref }}
       run: |
         set -euo pipefail
-        # Sparse-checkout of platform-gitops avoids OIDC + ECR-pull
-        # plumbing for a chart that lives in a public-to-us git repo.
-        # `--filter=blob:none --sparse` keeps the clone small (~2s
-        # vs ~30s for a full clone of platform-gitops).
-        tmp=$(mktemp -d)
-        git clone --depth=1 --filter=blob:none --sparse \
-          --branch "$REF" \
-          https://github.com/pinpredict/platform-gitops.git \
-          "$tmp/pg"
-        git -C "$tmp/pg" sparse-checkout set charts/service-template
-        echo "SERVICE_TEMPLATE_DIR=$tmp/pg/charts/service-template" >> "$GITHUB_ENV"
+        echo "SERVICE_TEMPLATE_DIR=${GITHUB_WORKSPACE}/.validate-service-template-pg/charts/service-template" >> "$GITHUB_ENV"
 
     - name: Install Helm + yq
       if: steps.resolve.outputs.any == 'true'

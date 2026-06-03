@@ -99,14 +99,25 @@ jobs:
   # Pre-merge gate for new/modified .platform/services/*.yaml. No-op
   # when the PR doesn't touch any engineer yaml; otherwise renders
   # each via service-template and fails CI on a broken yaml — the
-  # gap that bit dis-opticodds-props-streamer onboarding.
+  # gap that bit dis-opticodds-props-streamer onboarding. The app
+  # token mint is needed because the action sparse-clones
+  # `pinpredict/platform-gitops` (private) for service-template.
   validate-platform-services:
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
     steps:
+      - uses: actions/create-github-app-token@v2
+        id: pg-read-token
+        with:
+          app-id: ${{ secrets.BOOTSTRAP_APP_ID }}
+          private-key: ${{ secrets.BOOTSTRAP_APP_PRIVATE_KEY }}
+          owner: pinpredict
+          repositories: platform-gitops
       - uses: actions/checkout@v6
         with: { fetch-depth: 0 }
       - uses: pinpredict/.github/actions/validate-platform-service@main
+        with:
+          github-token: ${{ steps.pg-read-token.outputs.token }}
 
   docker-release:
     needs: [detect, test]
