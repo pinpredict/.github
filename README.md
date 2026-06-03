@@ -19,6 +19,7 @@ Why `.github` and not a dedicated `github-actions` repo: `.github` is *the* GitH
 | Action | Purpose |
 |---|---|
 | `discover-services` | Reads `.platform/services/*.yaml` and emits a docker matrix of services whose docker-relevant files changed since their last `image/<name>/*` tag. Also emits `charts_changed`. |
+| `validate-platform-service` | Pre-merge static + render check for added/modified `.platform/services/*.yaml`. Renders each via `charts/service-template` for every env in `environments[]` with all `renderXxx` flags forced on; verifies `repositories.chart` resolves to a real `charts/<x>/Chart.yaml`. Closes the gap from platform-gitops#544 — every dis-opticodds-props-streamer failure mode would have failed CI here. |
 | `setup-python-uv` | Install uv + a pinned Python version + (default-on) `uv sync`. |
 | `setup-node-pnpm` | corepack + setup-node@v4 with pnpm cache + (default-on) `pnpm install --frozen-lockfile`. Accepts a `pnpm-filter` input for workspace filtering. |
 | `setup-dotnet` | setup-dotnet@v5 with NuGet cache keyed on `**/*.csproj` + (default-off) `dotnet tool restore`. |
@@ -94,6 +95,18 @@ jobs:
             ^PinPredict\.Shared/
 
   # caller-owned language-specific test job here
+
+  # Pre-merge gate for new/modified .platform/services/*.yaml. No-op
+  # when the PR doesn't touch any engineer yaml; otherwise renders
+  # each via service-template and fails CI on a broken yaml — the
+  # gap that bit dis-opticodds-props-streamer onboarding.
+  validate-platform-services:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v6
+        with: { fetch-depth: 0 }
+      - uses: pinpredict/.github/actions/validate-platform-service@main
 
   docker-release:
     needs: [detect, test]
