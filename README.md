@@ -13,6 +13,7 @@ Why `.github` and not a dedicated `github-actions` repo: `.github` is *the* GitH
 | `docker-release.yml` | Matrix-based image build + push to ECR; per-service `image/<name>/X.Y.Z` git tags; aggregated GitHub Release. Caller passes a `matrix` input in the standard `{include:[...]}` shape. |
 | `chart-release.yml` | Auto-discovers `charts/*/`, bumps versions, packages, pushes to ECR OCI, tags `chart/<name>/X.Y.Z`. No caller inputs. |
 | `tag-config.yml` | Tags merges to main that touch `.platform/services/<svc>.yaml` with `vX.Y.Z+<svc>` (per-service Kargo `<svc>-config` Warehouse freight), then dispatches `service-config-tag` to platform-gitops so missing pointer files get seeded. |
+| `actionlint.yml` | Lints GitHub Actions workflow YAML with [`actionlint`](https://github.com/rhysd/actionlint) at a pinned version. Self-runs on this repo when PRs/pushes touch `.github/workflows/**` or `actions/**/action.yml`; callers reuse it via `uses: pinpredict/.github/.github/workflows/actionlint.yml@main`. |
 
 ### Composite actions (`actions/`)
 
