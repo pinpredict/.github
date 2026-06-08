@@ -1,0 +1,59 @@
+name: actionlint
+
+# Lints GitHub Actions workflow YAML.
+#
+# Two roles:
+#   1. Self-CI for this repo — runs on PRs/pushes that touch
+#      `.github/workflows/**` or `actions/**/action.yml`. Catches
+#      input-contract regressions in the reusable workflows here
+#      before they reach a caller as `startup_failure` at runtime
+#      (platform-gitops#944).
+#   2. Reusable entry point — callers (service-template's `ci.yml`
+#      and any onboarded repo) `uses:` this workflow to lint their
+#      own `.github/workflows/`.
+#
+# actionlint itself doesn't fetch remote reusable workflows, so it
+# cannot cross-validate that a caller's input map matches this
+# repo's `workflow_call.inputs:` block. It still catches the lion's
+# share of input-drift incidents (typos, removed-input refs in the
+# reusable workflow, expression and shell errors in both ends).
+
+on:
+  workflow_call: {}
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/**'
+      - 'actions/**/action.yml'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/**'
+      - 'actions/**/action.yml'
+
+# Pinned upstream release. Bump deliberately; actionlint occasionally
+# tightens rules in a way that flags previously-passing workflows.
+env:
+  ACTIONLINT_VERSION: "1.7.7"
+  # Scope shellcheck to warning+ severity. The gate's job is to catch
+  # input-contract regressions and real shell bugs (SC2086 quoting,
+  # SC2046 word-splitting, etc.); info/style nitpicks (SC2295, SC2001,
+  # SC2129) in long-standing `run:` blocks aren't worth blocking PRs
+  # over. Drop this once the existing scripts are tidied up.
+  SHELLCHECK_OPTS: "-S warning"
+
+jobs:
+  actionlint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install actionlint
+        run: |
+          set -euo pipefail
+          bash <(curl -fsSL \
+            "https://raw.githubusercontent.com/rhysd/actionlint/v${ACTIONLINT_VERSION}/scripts/download-actionlint.bash") \
+            "${ACTIONLINT_VERSION}"
+
+      - name: Run actionlint
+        run: ./actionlint -color

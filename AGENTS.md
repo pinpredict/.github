@@ -13,7 +13,7 @@ Callers pin to `@main` (intentional — we own all consumers; pre-tagging adds o
 - `actions/<name>/action.yml` — composite actions. Used as `uses: pinpredict/.github/actions/<name>@main`.
 - `.github/workflows/<name>.yml` — reusable workflows. Used as `uses: pinpredict/.github/.github/workflows/<name>.yml@main`.
 
-There is no build, lint, or test step in this repo. Validate changes by running them against a real caller (open a draft PR in a service repo that points its `uses:` at your branch).
+Static lint: `actionlint.yml` runs on every PR that touches `.github/workflows/**` or `actions/**/action.yml`, catching workflow syntax / expression / shell / `workflow_call` input-contract errors before they reach a caller as a runtime `startup_failure`. No build or test step — semantic changes still need a draft PR in a real caller pointing its `uses:` at your branch.
 
 ## Architectural contracts other repos depend on
 
