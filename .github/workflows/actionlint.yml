@@ -14,9 +14,10 @@ name: actionlint
 #
 # actionlint itself doesn't fetch remote reusable workflows, so it
 # cannot cross-validate that a caller's input map matches this
-# repo's `workflow_call.inputs:` block. It still catches the lion's
-# share of input-drift incidents (typos, removed-input refs in the
-# reusable workflow, expression and shell errors in both ends).
+# repo's `workflow_call.inputs:` block. The companion job
+# `validate-reusable-inputs` below closes that gap (PG#1045) by
+# diffing every caller `with:` block against the referenced
+# workflow's declared `on.workflow_call.inputs` map.
 
 on:
   workflow_call: {}
@@ -51,3 +52,34 @@ jobs:
 
       - name: Run actionlint
         run: ./actionlint -color
+
+  # Cross-repo input validation for `uses: pinpredict/.github/...@ref`
+  # callers. actionlint can't reach the remote workflow's
+  # `workflow_call.inputs` map, so a renamed/removed input still surfaces
+  # only at runtime as `startup_failure`. This job diffs caller `with:`
+  # blocks against the referenced workflow and fails on unknown or
+  # missing-required keys. No-op when the caller has no
+  # `pinpredict/.github` reusable-workflow `uses:` lines.
+  validate-reusable-inputs:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout caller workflows
+        uses: actions/checkout@v6
+
+      # `uses: ./...` in a reusable workflow resolves against the
+      # caller's checkout, not this repo — so we vendor a copy of
+      # pinpredict/.github at the exact SHA this workflow file came
+      # from. github.workflow_sha is the PR head SHA in self-CI and
+      # the @ref SHA when invoked from a downstream caller. This also
+      # sidesteps the @main bootstrap chicken-and-egg the first time
+      # the action lands.
+      - name: Checkout pinpredict/.github at workflow ref
+        uses: actions/checkout@v6
+        with:
+          repository: pinpredict/.github
+          ref: ${{ github.workflow_sha }}
+          path: .pinpredict-github
+
+      - uses: ./.pinpredict-github/actions/validate-reusable-inputs
