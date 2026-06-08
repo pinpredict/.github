@@ -73,7 +73,7 @@ jobs:
             if [ -z "$latest" ]; then
               candidate="0.0.1"
             else
-              version="${latest#${prefix}}"
+              version="${latest#"${prefix}"}"
               IFS='.' read -r major minor patch <<< "$version"
               candidate="${major}.${minor}.$((patch + 1))"
             fi
