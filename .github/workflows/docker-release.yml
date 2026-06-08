@@ -184,6 +184,12 @@ jobs:
             # for backend services). Dockerfiles that don't declare
             # `ARG APP_VERSION` silently ignore it.
             --build-arg "APP_VERSION=${version}"
+            # Stamp the git short-SHA too. Unlike the per-repo `0.0.X`
+            # version (a build-ID), the commit is identical iff the code is
+            # identical — the reliable "is this the same build?" signal for
+            # services on parallel lanes (e.g. trader-tools stable vs dev).
+            # Dockerfiles that don't declare `ARG GIT_SHA` silently ignore it.
+            --build-arg "GIT_SHA=${SHORT_SHA}"
           )
           if [ -n "${TARGET}" ]; then
             buildx_args+=(--target "${TARGET}")
