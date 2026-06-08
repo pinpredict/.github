@@ -65,6 +65,21 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v6
+      - name: Checkout caller workflows
+        uses: actions/checkout@v6
 
-      - uses: pinpredict/.github/actions/validate-reusable-inputs@main
+      # `uses: ./...` in a reusable workflow resolves against the
+      # caller's checkout, not this repo — so we vendor a copy of
+      # pinpredict/.github at the exact SHA this workflow file came
+      # from. github.workflow_sha is the PR head SHA in self-CI and
+      # the @ref SHA when invoked from a downstream caller. This also
+      # sidesteps the @main bootstrap chicken-and-egg the first time
+      # the action lands.
+      - name: Checkout pinpredict/.github at workflow ref
+        uses: actions/checkout@v6
+        with:
+          repository: pinpredict/.github
+          ref: ${{ github.workflow_sha }}
+          path: .pinpredict-github
+
+      - uses: ./.pinpredict-github/actions/validate-reusable-inputs
