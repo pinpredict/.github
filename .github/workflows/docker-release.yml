@@ -134,7 +134,7 @@ jobs:
           if [ -z "$latest_tag" ]; then
             major=0; minor=0; patch=0
           else
-            version="${latest_tag#${prefix}}"
+            version="${latest_tag#"${prefix}"}"
             IFS='.' read -r major minor patch <<< "$version"
           fi
           patch=$((patch + 1))

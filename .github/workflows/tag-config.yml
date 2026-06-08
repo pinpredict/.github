@@ -78,10 +78,14 @@ jobs:
           fi
 
           echo "Services to tag:"
-          echo "$services" | sed 's/^/  - /'
-          echo "list<<EOF" >> "$GITHUB_OUTPUT"
-          echo "$services" >> "$GITHUB_OUTPUT"
-          echo "EOF" >> "$GITHUB_OUTPUT"
+          while IFS= read -r svc; do
+            echo "  - $svc"
+          done <<< "$services"
+          {
+            echo "list<<EOF"
+            echo "$services"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Compute and push tags
         if: steps.changed.outputs.list != ''
@@ -100,7 +104,7 @@ jobs:
               next="v0.0.1+${svc}"
             else
               version="${latest#v}"
-              version="${version%+${svc}}"
+              version="${version%+"${svc}"}"
               IFS='.' read -r major minor patch <<< "$version"
               next="v${major}.${minor}.$((patch + 1))+${svc}"
             fi

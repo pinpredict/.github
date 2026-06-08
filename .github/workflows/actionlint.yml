@@ -35,12 +35,6 @@ on:
 # tightens rules in a way that flags previously-passing workflows.
 env:
   ACTIONLINT_VERSION: "1.7.7"
-  # Scope shellcheck to warning+ severity. The gate's job is to catch
-  # input-contract regressions and real shell bugs (SC2086 quoting,
-  # SC2046 word-splitting, etc.); info/style nitpicks (SC2295, SC2001,
-  # SC2129) in long-standing `run:` blocks aren't worth blocking PRs
-  # over. Drop this once the existing scripts are tidied up.
-  SHELLCHECK_OPTS: "-S warning"
 
 jobs:
   actionlint:
