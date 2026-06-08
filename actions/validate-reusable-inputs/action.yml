@@ -1,0 +1,56 @@
+name: Validate reusable-workflow inputs
+description: |
+  Pre-merge cross-repo input validation for callers of
+  `pinpredict/.github` reusable workflows.
+
+  Closes the gap left by stock `actionlint` (PG#1045): actionlint
+  doesn't fetch remote reusable workflows, so a caller passing a
+  removed or renamed `with:` key to
+  `pinpredict/.github/.github/workflows/<x>.yml@<ref>` only fails at
+  runtime as `startup_failure`. This action diffs every caller `with:`
+  block against the remote workflow's declared `on.workflow_call.inputs`
+  map and fails CI on:
+
+    * unknown keys (typos, removed/renamed inputs)
+    * missing keys that the callee declares `required: true`
+
+  Scope: reusable workflows under `pinpredict/.github/.github/workflows/`.
+  Composite actions under `pinpredict/.github/actions/` are NOT validated
+  here — actionlint already catches unknown inputs on those when the
+  action.yml is checked out locally.
+
+inputs:
+  workflows-glob:
+    description: |
+      Glob (relative to the repo root) of caller workflow files to scan.
+      Defaults to every yaml under `.github/workflows/`.
+    required: false
+    default: ".github/workflows/*.yml .github/workflows/*.yaml"
+  central-repo:
+    description: |
+      `owner/repo` of the reusable-workflow source. Only `uses:` lines
+      pointing at this repo are validated.
+    required: false
+    default: "pinpredict/.github"
+  github-token:
+    description: |
+      Token with `contents: read` on `central-repo`. Defaults to the
+      job's `GITHUB_TOKEN`, which works when this action runs inside a
+      reusable workflow hosted in `central-repo` (same-repo read).
+      Override with a PAT or GitHub App token for cross-repo runs where
+      the default token lacks access.
+    required: false
+    default: ${{ github.token }}
+
+runs:
+  using: composite
+  steps:
+    - name: Validate
+      shell: bash
+      env:
+        WORKFLOWS_GLOB: ${{ inputs.workflows-glob }}
+        CENTRAL_REPO: ${{ inputs.central-repo }}
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: |
+        set -euo pipefail
+        python3 "${GITHUB_ACTION_PATH}/validate_reusable_inputs.py"
