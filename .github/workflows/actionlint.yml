@@ -70,26 +70,35 @@ jobs:
 
       # `uses: ./...` in a reusable workflow resolves against the
       # caller's checkout, not this repo — so we vendor a copy of
-      # pinpredict/.github at the exact ref this workflow file came
-      # from. Earlier revisions used `github.workflow_sha`, which
-      # actually returns the *caller's* SHA in cross-repo reusable
-      # calls — fine for self-CI (the caller and this repo are the
-      # same), broken for every downstream consumer ("not our ref"
-      # against pinpredict/.github on the caller's head SHA).
+      # pinpredict/.github and reference the action from there.
       #
-      # `github.workflow_ref` shape:
-      #   `<owner>/<repo>/.github/workflows/<file>.yml@<git-ref>`
-      # Splitting on `@` yields a ref `actions/checkout` resolves
-      # against pinpredict/.github — `refs/heads/main` for downstream
-      # callers using `@main`, `refs/pull/N/merge` for self-CI PR
-      # runs, a SHA when pinned.
+      # Picking the right ref is the tricky part. Neither
+      # `github.workflow_sha` nor `github.workflow_ref` exposes the
+      # reusable workflow's own ref to a downstream caller:
+      #   - `workflow_sha` returns the caller's commit SHA.
+      #   - `workflow_ref` returns the caller's workflow file path,
+      #     e.g. `pinpredict/trading-reports/.github/workflows/ci.yml@refs/pull/5/merge`.
+      # Both prior attempts (`73a31ca`, `31626de`) failed downstream
+      # for this reason.
+      #
+      # Fall back to convention: per pinpredict/.github's CLAUDE.md,
+      # downstream callers always pin `@main`, so checking out main
+      # gets a downstream consumer the same action source the runner
+      # already loaded for the workflow itself. For self-CI we use
+      # `github.ref` so that PR-mode runs see the PR's version of the
+      # action (refs/pull/N/merge), not main's.
       - name: Resolve workflow ref
         id: workflow-ref
         env:
-          GITHUB_WORKFLOW_REF: ${{ github.workflow_ref }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_REF: ${{ github.ref }}
         run: |
           set -euo pipefail
-          ref="${GITHUB_WORKFLOW_REF#*@}"
+          if [ "$GITHUB_REPOSITORY" = "pinpredict/.github" ]; then
+            ref="$GITHUB_REF"
+          else
+            ref="refs/heads/main"
+          fi
           printf 'ref=%s\n' "$ref" >> "$GITHUB_OUTPUT"
 
       - name: Checkout pinpredict/.github at workflow ref
