@@ -70,16 +70,33 @@ jobs:
 
       # `uses: ./...` in a reusable workflow resolves against the
       # caller's checkout, not this repo — so we vendor a copy of
-      # pinpredict/.github at the exact SHA this workflow file came
-      # from. github.workflow_sha is the PR head SHA in self-CI and
-      # the @ref SHA when invoked from a downstream caller. This also
-      # sidesteps the @main bootstrap chicken-and-egg the first time
-      # the action lands.
+      # pinpredict/.github at the exact ref this workflow file came
+      # from. Earlier revisions used `github.workflow_sha`, which
+      # actually returns the *caller's* SHA in cross-repo reusable
+      # calls — fine for self-CI (the caller and this repo are the
+      # same), broken for every downstream consumer ("not our ref"
+      # against pinpredict/.github on the caller's head SHA).
+      #
+      # `github.workflow_ref` shape:
+      #   `<owner>/<repo>/.github/workflows/<file>.yml@<git-ref>`
+      # Splitting on `@` yields a ref `actions/checkout` resolves
+      # against pinpredict/.github — `refs/heads/main` for downstream
+      # callers using `@main`, `refs/pull/N/merge` for self-CI PR
+      # runs, a SHA when pinned.
+      - name: Resolve workflow ref
+        id: workflow-ref
+        env:
+          GITHUB_WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          set -euo pipefail
+          ref="${GITHUB_WORKFLOW_REF#*@}"
+          printf 'ref=%s\n' "$ref" >> "$GITHUB_OUTPUT"
+
       - name: Checkout pinpredict/.github at workflow ref
         uses: actions/checkout@v6
         with:
           repository: pinpredict/.github
-          ref: ${{ github.workflow_sha }}
+          ref: ${{ steps.workflow-ref.outputs.ref }}
           path: .pinpredict-github
 
       - uses: ./.pinpredict-github/actions/validate-reusable-inputs
