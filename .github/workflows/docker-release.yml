@@ -34,6 +34,20 @@ on:
         description: "JSON matrix of services to build (GitHub Actions matrix `include` shape)"
         required: true
         type: string
+      private-modules:
+        description: >-
+          Mint a short-lived, read-only token for the org-wide pinpredict-argocd
+          App (BOOTSTRAP_APP_ID / BOOTSTRAP_APP_PRIVATE_KEY) and expose it to the
+          build as BuildKit secret `id=gh_token`. Opt-in for services whose
+          Dockerfile fetches a private pinpredict module instead of vendoring it
+          (e.g. a Go repo that requires github.com/pinpredict/ppkit) via
+          `RUN --mount=type=secret,id=gh_token ... go mod download`. Handed to
+          buildx as a `--secret`, never a `--build-arg`, so it never lands in an
+          image layer or `docker history`. Default false — a no-op for every
+          existing caller.
+        required: false
+        type: boolean
+        default: false
 
 env:
   AWS_REGION: us-east-1
@@ -78,6 +92,23 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
+      # Opt-in (private-modules: true): mint a short-lived, read-only token for
+      # the org-wide pinpredict-argocd App so the build can fetch private
+      # pinpredict modules without vendoring. contents:read across the org (the
+      # App is installed on all repos); consumed by buildx as a BuildKit
+      # `--secret` below — never a build-arg — so it never lands in an image
+      # layer or `docker history`. Skipped (and the secret omitted) for every
+      # caller that leaves private-modules at its default false.
+      - name: Mint private-module read token
+        id: private-module-token
+        if: ${{ inputs.private-modules }}
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.BOOTSTRAP_APP_ID }}
+          private-key: ${{ secrets.BOOTSTRAP_APP_PRIVATE_KEY }}
+          owner: pinpredict
+          permission-contents: read
+
       - name: Resolve version, build, push, tag
         id: release
         env:
@@ -89,6 +120,9 @@ jobs:
           ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
           SHORT_SHA: ${{ github.sha }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Empty unless private-modules minted a token above; gates the
+          # BuildKit --secret so it's a no-op for every other caller.
+          GH_PRIVATE_TOKEN: ${{ steps.private-module-token.outputs.token }}
         run: |
           set -euo pipefail
           SHORT_SHA="${SHORT_SHA:0:7}"
@@ -157,6 +191,15 @@ jobs:
               [ -z "$ba" ] && continue
               buildx_args+=(--build-arg "$ba")
             done <<< "${BUILD_ARGS}"
+          fi
+
+          # Private-module fetch (inputs.private-modules): hand the minted App
+          # token to the build as a BuildKit secret, readable inside the
+          # Dockerfile at /run/secrets/gh_token via
+          # `RUN --mount=type=secret,id=gh_token`. Only added when the token
+          # step ran (env non-empty) — a no-op for every other caller.
+          if [ -n "${GH_PRIVATE_TOKEN:-}" ]; then
+            buildx_args+=(--secret "id=gh_token,env=GH_PRIVATE_TOKEN")
           fi
 
           docker buildx build "${buildx_args[@]}" .
