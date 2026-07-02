@@ -8,9 +8,10 @@ name: Helm Chart Release
 #     tag as fallback) unless workflow_dispatch forced a release.
 #   - Resolves the next version from the ECR OCI repo (highest X.Y.Z
 #     tag + 1 — the artifact store is the version record,
-#     platform-gitops#1201), packages, pushes, advances the marker ref,
-#     mints the legacy git tag, contributes to one aggregated GitHub
-#     Release.
+#     platform-gitops#1201), packages, pushes (plus the X.Y.Z-<sha7>
+#     provenance alias), advances the marker ref, and notifies Dispatch.
+#     No git tags or GitHub Releases are minted — historical
+#     `chart/<name>/X.Y.Z` tags remain as the frozen fallback baseline.
 #
 # Caller has no inputs; auto-discovery handles everything. Each repo's
 # `ci.yml` decides whether to call this workflow.
@@ -156,9 +157,7 @@ jobs:
           set -euo pipefail
 
           # The ECR OCI repo is the version record: next version is a
-          # patch bump of the highest X.Y.Z tag already pushed. Git tags
-          # are a legacy mirror, still minted below for deploy
-          # correlation but no longer read (platform-gitops#1201). A
+          # patch bump of the highest X.Y.Z tag already pushed. A
           # missing repo or an empty tag list both mean first release.
           latest=$(aws ecr describe-images \
             --repository-name "charts/${NAME}" \
@@ -184,7 +183,6 @@ jobs:
             patch=$((patch + 1))
           done
           version="${major}.${minor}.${patch}"
-          tag="chart/${NAME}/${version}"
 
           # Stamp the resolved version into Chart.yaml before packaging
           sed -i "s/^version:.*/version: ${version}/" "${DIR}/Chart.yaml"
@@ -221,25 +219,6 @@ jobs:
               >/dev/null
           } || echo "::warning::sha alias tag failed for charts/${NAME}:${version}-${SHORT_SHA}"
 
-          # Tag immediately after successful push (retry up to 3 times).
-          # If permanent failure the chart sits in ECR with no git tag —
-          # the next run's recovery loop will reclaim it.
-          git tag "$tag"
-          tag_pushed=false
-          for attempt in 1 2 3; do
-            if git push origin "$tag"; then
-              tag_pushed=true
-              break
-            fi
-            echo "::warning::Git tag push attempt ${attempt}/3 failed for ${tag}"
-            sleep 2
-          done
-
-          if [ "$tag_pushed" != true ]; then
-            echo "::error::Git tag push failed after 3 attempts for ${tag} — chart already in ECR!"
-            exit 1
-          fi
-
           # Advance the per-chart release marker — one mutable ref, not
           # a tag, so it is invisible to Kargo's tag enumeration and the
           # GitHub create-webhook. The prepare job diffs against it to
@@ -247,14 +226,11 @@ jobs:
           git push --force origin "${GITHUB_SHA}:refs/releases/chart/${NAME}" \
             || echo "::warning::Marker ref push failed for refs/releases/chart/${NAME} — next run falls back to the legacy tag baseline"
 
-          mkdir -p release-info
-          echo "${NAME} ${version}" > "release-info/${NAME}.txt"
           echo "version=${version}" >> "$GITHUB_OUTPUT"
 
-      # Direct publish signal to Dispatch (platform-gitops#1201) — the
-      # replacement for the create-webhook on the legacy git tag. Never
-      # fails the release; the EventBridge ECR-push backstop covers a
-      # missed notification.
+      # The publish signal (platform-gitops#1201). Never fails the
+      # release; the EventBridge ECR-push backstop covers a missed
+      # notification.
       - name: Notify Dispatch
         if: steps.release.outcome == 'success'
         uses: pinpredict/.github/actions/notify-dispatch@main
@@ -264,53 +240,15 @@ jobs:
           version: ${{ steps.release.outputs.version }}
           secret: ${{ secrets.CI_WEBHOOK_SECRET }}
 
-      - name: Upload release info
-        if: steps.release.outcome == 'success'
-        uses: actions/upload-artifact@v7
-        with:
-          name: chart-release-info-${{ matrix.name }}
-          path: release-info/${{ matrix.name }}.txt
-          retention-days: 1
-
+  # Kept as the aggregate fail-gate (stable check name for branch
+  # protection). The GitHub release it used to create was keyed off the
+  # legacy chart/* git tag; Dispatch's Slack cards carry the per-service
+  # changelog now (platform-gitops#1201).
   release-summary:
     needs: package
     if: ${{ !cancelled() && needs.package.result != 'skipped' }}
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    env:
-      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@v6
-
-      - name: Download chart-release-info artifacts
-        uses: actions/download-artifact@v7
-        with:
-          path: release-info
-          pattern: chart-release-info-*
-          merge-multiple: true
-
-      - name: Create aggregated GitHub release
-        run: |
-          set -euo pipefail
-          shopt -s nullglob
-          released=()
-          for f in release-info/*.txt; do
-            released+=("$(cat "$f")")
-          done
-
-          if [ ${#released[@]} -eq 0 ]; then
-            echo "No charts were released."
-            exit 0
-          fi
-
-          title="Charts: $(IFS=', '; echo "${released[*]}")"
-          first_name="${released[0]%% *}"
-          first_ver="${released[0]##* }"
-          gh release create "chart/${first_name}/${first_ver}" \
-            --generate-notes \
-            --title "$title"
-
       - name: Fail if any package failed
         if: needs.package.result != 'success'
         run: |
