@@ -27,7 +27,7 @@ Why `.github` and not a dedicated `github-actions` repo: `.github` is *the* GitH
 | `setup-python-uv` | Install uv + a pinned Python version + (default-on) `uv sync`. |
 | `setup-node-pnpm` | corepack + setup-node@v4 with pnpm cache + (default-on) `pnpm install --frozen-lockfile`. Accepts a `pnpm-filter` input for workspace filtering. |
 | `setup-dotnet` | setup-dotnet@v5 with NuGet cache keyed on `**/*.csproj` + (default-off) `dotnet tool restore`. |
-| `setup-go` | setup-go@v6 reading version from `go.mod`. |
+| `setup-go` | setup-go@v6 reading version from `go.mod`. Optional `private-modules: true` mints a short-lived read-only `pinpredict-argocd` App token and configures git + `GOPRIVATE` so `go`/`golangci-lint`/`goreleaser` fetch a private pinpredict module (e.g. `github.com/pinpredict/ppkit`) without vendoring — the non-Docker analogue of `docker-release.yml`'s `private-modules` secret. Default false. |
 
 #### Language setup composites — usage
 
@@ -57,6 +57,13 @@ Why `.github` and not a dedicated `github-actions` repo: `.github` is *the* GitH
 - uses: pinpredict/.github/actions/setup-go@main
   with:
     go-version-file: "go.mod" # optional; default "go.mod"
+
+# Go, fetching a private pinpredict module without vendoring (e.g. k4a → ppkit)
+- uses: pinpredict/.github/actions/setup-go@main
+  with:
+    private-modules: "true"                                          # opt-in; default false
+    private-modules-app-id: ${{ secrets.BOOTSTRAP_APP_ID }}          # pinpredict-argocd App
+    private-modules-app-private-key: ${{ secrets.BOOTSTRAP_APP_PRIVATE_KEY }}
 ```
 
 ## How to use
