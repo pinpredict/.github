@@ -112,7 +112,7 @@ jobs:
         run: dotnet tool restore
 
       # Optional: install Node + enable pnpm + install workspace deps.
-      # setup-node@v4 with cache:pnpm caches the pnpm content-addressable
+      # setup-node@v6 with cache:pnpm caches the pnpm content-addressable
       # store across runs, so `pnpm install --frozen-lockfile` is mostly
       # a symlink-create after the first run (5-10s typical).
       - name: Enable corepack (pnpm)
@@ -204,7 +204,7 @@ jobs:
       - name: Find existing advisory comment
         if: github.event_name == 'pull_request'
         id: find
-        uses: peter-evans/find-comment@v3
+        uses: peter-evans/find-comment@v4
         with:
           issue-number: ${{ github.event.pull_request.number }}
           comment-author: github-actions[bot]
@@ -212,7 +212,7 @@ jobs:
 
       - name: Post or update PR comment
         if: github.event_name == 'pull_request'
-        uses: peter-evans/create-or-update-comment@v4
+        uses: peter-evans/create-or-update-comment@v5
         with:
           comment-id: ${{ steps.find.outputs.comment-id }}
           issue-number: ${{ github.event.pull_request.number }}
