@@ -226,6 +226,20 @@ jobs:
 
           mkdir -p release-info
           echo "${NAME} ${version}" > "release-info/${NAME}.txt"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      # Direct publish signal to Dispatch (platform-gitops#1201) — the
+      # replacement for the create-webhook on the legacy git tag. Never
+      # fails the release; the EventBridge ECR-push backstop covers a
+      # missed notification.
+      - name: Notify Dispatch
+        if: steps.release.outcome == 'success'
+        uses: pinpredict/.github/actions/notify-dispatch@main
+        with:
+          kind: image
+          service: ${{ matrix.name }}
+          version: ${{ steps.release.outputs.version }}
+          secret: ${{ secrets.CI_WEBHOOK_SECRET }}
 
       - name: Upload release info
         if: steps.release.outcome == 'success'

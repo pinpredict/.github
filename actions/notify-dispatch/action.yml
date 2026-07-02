@@ -1,0 +1,63 @@
+name: notify-dispatch
+description: >-
+  Notify Dispatch that an artifact was published (platform-gitops#1201).
+  POSTs a signed publish notification through the public webhook-forwarder
+  /dispatch/ci route so the deploy flow's publish stage fills without the
+  legacy image/*+chart/* git-tag webhook. Never fails the release: a missed
+  notification is covered by the EventBridge ECR-push backstop.
+
+inputs:
+  kind:
+    description: '"image" or "chart"'
+    required: true
+  service:
+    description: Service / chart name (the tag's middle segment)
+    required: true
+  version:
+    description: Released version (X.Y.Z)
+    required: true
+  secret:
+    description: >-
+      HMAC secret (org Actions secret CI_WEBHOOK_SECRET, reaches reusable
+      workflows via `secrets: inherit`). Empty skips the notification with
+      a warning rather than failing — the ECR-push backstop still covers
+      deploy tracking.
+    required: true
+  url:
+    description: Public /dispatch/ci endpoint (webhook-forwarder API Gateway, dev)
+    required: false
+    default: "https://gd7tapt7j8.execute-api.us-east-1.amazonaws.com/dispatch/ci"
+
+runs:
+  using: composite
+  steps:
+    - name: Notify Dispatch
+      shell: bash
+      env:
+        KIND: ${{ inputs.kind }}
+        SERVICE: ${{ inputs.service }}
+        VERSION: ${{ inputs.version }}
+        SECRET: ${{ inputs.secret }}
+        URL: ${{ inputs.url }}
+        RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      run: |
+        set -euo pipefail
+        if [ -z "${SECRET}" ]; then
+          echo "::warning::CI_WEBHOOK_SECRET not available — skipping Dispatch notification (ECR-push backstop covers deploy tracking)"
+          exit 0
+        fi
+
+        body=$(printf '{"repo":"%s","kind":"%s","service":"%s","version":"%s","sha":"%s","run_url":"%s"}' \
+          "${GITHUB_REPOSITORY}" "${KIND}" "${SERVICE}" "${VERSION}" "${GITHUB_SHA}" "${RUN_URL}")
+        sig=$(printf '%s' "$body" | openssl dgst -sha256 -hmac "${SECRET}" | awk '{print $NF}')
+
+        status=$(curl -sS -o /tmp/dispatch-resp.json -w '%{http_code}' -X POST "${URL}" \
+          -H "Content-Type: application/json" \
+          -H "X-Dispatch-Signature: ${sig}" \
+          --data "$body" || echo "000")
+
+        if [ "$status" -ge 200 ] && [ "$status" -lt 300 ]; then
+          echo "Dispatch notified: ${KIND} ${SERVICE} ${VERSION}"
+        else
+          echo "::warning::Dispatch notification returned ${status}: $(cat /tmp/dispatch-resp.json 2>/dev/null || true) — ECR-push backstop covers this release"
+        fi
