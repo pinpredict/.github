@@ -266,32 +266,46 @@ runs:
             includes=""
           fi
 
+          # Release baselines live in per-service marker refs
+          # (refs/releases/image/<name>, advanced by docker-release on
+          # each successful push — platform-gitops#1201). They are not
+          # tags, so checkout's fetch-tags does not bring them in.
+          git fetch --quiet origin '+refs/releases/*:refs/releases/*' || true
+
           entries=()
           for def in "${SERVICE_DEFS[@]}"; do
             IFS='|' read -r name ecr dockerfile target build_args source_patterns <<< "$def"
 
-            # `set -o pipefail` + `grep ... | head -n1` is SIGPIPE-prone:
-            # head closes the pipe after one line, grep gets SIGPIPE mid-write,
-            # the pipeline exits non-zero, and `set -e` aborts the whole job.
-            # The race fires deterministically in repos with many image tags
-            # (250+ in trading), where grep's stdio buffer is still full at
-            # the moment head closes. `|| true` swallows the pipeline status —
-            # an empty `latest_tag` is handled by the `[ -z ... ]` block below.
-            latest_tag=$(git tag --list "image/${name}/*" --sort=-v:refname \
-              | grep -E "^image/${name}/[0-9]+\.[0-9]+\.[0-9]+$" | head -n1 || true)
+            base=""
+            if git rev-parse -q --verify "refs/releases/image/${name}" >/dev/null; then
+              base="refs/releases/image/${name}"
+            else
+              # Legacy fallback until the service has released once with
+              # the marker ref in place.
+              #
+              # `set -o pipefail` + `grep ... | head -n1` is SIGPIPE-prone:
+              # head closes the pipe after one line, grep gets SIGPIPE mid-write,
+              # the pipeline exits non-zero, and `set -e` aborts the whole job.
+              # The race fires deterministically in repos with many image tags
+              # (250+ in trading), where grep's stdio buffer is still full at
+              # the moment head closes. `|| true` swallows the pipeline status —
+              # an empty `base` is handled by the `[ -z ... ]` block below.
+              base=$(git tag --list "image/${name}/*" --sort=-v:refname \
+                | grep -E "^image/${name}/[0-9]+\.[0-9]+\.[0-9]+$" | head -n1 || true)
+            fi
 
-            if [ -z "$latest_tag" ]; then
-              echo "${name}: no previous tags — first release"
+            if [ -z "$base" ]; then
+              echo "${name}: no release baseline — first release"
               entries+=("$(json_entry "$name" "$ecr" "$dockerfile" "$target" "$build_args")")
               continue
             fi
 
             if [ -n "$includes" ]; then
-              docker_changed=$(git diff --name-only "${latest_tag}..HEAD" \
+              docker_changed=$(git diff --name-only "${base}..HEAD" \
                 | grep -E "^($(echo "$includes" | paste -sd'|' -))" || true)
             else
               # No .dockerignore allow-list — treat everything as docker-relevant.
-              docker_changed=$(git diff --name-only "${latest_tag}..HEAD")
+              docker_changed=$(git diff --name-only "${base}..HEAD")
             fi
 
             [ -z "$docker_changed" ] && { echo "${name}: no docker-relevant changes — skipping"; continue; }

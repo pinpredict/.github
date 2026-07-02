@@ -17,11 +17,15 @@ name: Docker Release
 #     ]
 #   }
 #
-# Each successful build pushes the image, creates an immutable git tag
-# `image/<name>/X.Y.Z`, and contributes to a single aggregated GitHub
-# Release at the end of the run. Pinpoint correlates on the per-service
-# git tags via the `create` webhook, so multi-service runs map cleanly to
-# per-service deploy flows.
+# Version resolution reads ECR (highest X.Y.Z tag + 1) — the artifact
+# store is the version record (platform-gitops#1201). Each successful
+# build pushes the image, advances the `refs/releases/image/<name>`
+# marker ref (the change-detection baseline for discover-services),
+# creates an immutable git tag `image/<name>/X.Y.Z`, and contributes to
+# a single aggregated GitHub Release at the end of the run. Dispatch
+# still correlates on the per-service git tags via the `create` webhook;
+# the tags and Releases go away once Dispatch is notified directly
+# (#1201 dependency 2).
 
 on:
   workflow_call:
@@ -126,43 +130,34 @@ jobs:
           set -euo pipefail
           SHORT_SHA="${SHORT_SHA:0:7}"
 
-          # Compute candidate version from latest existing tag
-          prefix="image/${NAME}/"
-          latest_tag=$(git tag --list "${prefix}*" --sort=-v:refname \
-            | grep -E "^image/${NAME}/[0-9]+\.[0-9]+\.[0-9]+$" | head -n1 || true)
+          # The ECR repo is the version record: next version is a patch
+          # bump of the highest X.Y.Z tag already pushed (the -<sha>
+          # sibling tags are filtered out). Git tags are a legacy mirror,
+          # still minted below for deploy correlation but no longer read
+          # (platform-gitops#1201). A missing repo or an empty tag list
+          # both mean first release.
+          latest=$(aws ecr describe-images \
+            --repository-name "${ECR_REPO}" \
+            --filter tagStatus=TAGGED \
+            --query 'imageDetails[].imageTags[]' --output text 2>/dev/null \
+            | tr '[:space:]' '\n' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
+            | sort -V | tail -n1 || true)
 
-          if [ -z "$latest_tag" ]; then
+          if [ -z "$latest" ]; then
             major=0; minor=0; patch=0
           else
-            version="${latest_tag#"${prefix}"}"
-            IFS='.' read -r major minor patch <<< "$version"
+            IFS='.' read -r major minor patch <<< "$latest"
           fi
           patch=$((patch + 1))
 
-          # Bump past any version that already exists as a git tag or in
-          # ECR (immutable). Recovers stranded ECR images that lost their
-          # git tag from a prior partial run.
-          while true; do
-            candidate="${major}.${minor}.${patch}"
-            tag="image/${NAME}/${candidate}"
-
-            if git tag --list "$tag" | grep -q .; then
-              echo "Git tag ${tag} already exists — bumping"
-              patch=$((patch + 1))
-              continue
-            fi
-
-            if aws ecr describe-images \
-                --repository-name "${ECR_REPO}" \
-                --image-ids imageTag="${candidate}" >/dev/null 2>&1; then
-              echo "::warning::Image ${ECR_REPO}:${candidate} exists in ECR but no git tag — recovering"
-              git tag "$tag"
-              git push origin "$tag" || echo "::warning::Recovery tag push failed for ${tag}"
-              patch=$((patch + 1))
-              continue
-            fi
-
-            break
+          # ECR tags are immutable — probe-and-bump past any candidate
+          # that already exists (covers races that slip the workflow
+          # concurrency group and repos with gaps above the max semver).
+          while aws ecr describe-images \
+              --repository-name "${ECR_REPO}" \
+              --image-ids imageTag="${major}.${minor}.${patch}" >/dev/null 2>&1; do
+            echo "Image ${ECR_REPO}:${major}.${minor}.${patch} exists in ECR — bumping"
+            patch=$((patch + 1))
           done
           version="${major}.${minor}.${patch}"
           tag="image/${NAME}/${version}"
@@ -221,6 +216,13 @@ jobs:
             echo "::error::Git tag push failed after 3 attempts for ${tag} — image already in ECR!"
             exit 1
           fi
+
+          # Advance the per-service release marker — one mutable ref,
+          # not a tag, so it is invisible to Kargo's tag enumeration and
+          # the GitHub create-webhook. discover-services diffs against
+          # it to decide whether the service needs a rebuild.
+          git push --force origin "${GITHUB_SHA}:refs/releases/image/${NAME}" \
+            || echo "::warning::Marker ref push failed for refs/releases/image/${NAME} — next run falls back to the legacy tag baseline"
 
           mkdir -p release-info
           echo "${NAME} ${version}" > "release-info/${NAME}.txt"

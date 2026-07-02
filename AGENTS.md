@@ -32,15 +32,15 @@ Both `docker-release.yml` and `chart-release.yml` assume the deterministic role 
 
 Both workflows use a three-shot retry pattern (try / sleep 30 / retry / sleep 60 / retry) on `configure-aws-credentials` to survive the race where Crossplane is still creating the per-service role on first colocation. Incident reference: pinpredict/trading#616 (2-second race). Keep the retry pattern when editing AWS auth steps.
 
-### Image / chart tagging conventions
+### Image / chart versioning and tagging conventions
 
-- Per-service image tag: `image/<name>/X.Y.Z` (immutable git tag, pushed after successful ECR push)
-- Per-chart tag: `chart/<name>/X.Y.Z`
-- Per-service config tag (Kargo freight for `<svc>-config` Warehouse): `vX.Y.Z+<svc>` — semver **build metadata** form (`+`), not pre-release (`-`). The `+` form passes `semverConstraint: ">=0.0.0"` cleanly; the pre-release form would require `>=0.0.0-0`.
+- **ECR is the version record** (platform-gitops#1201): both release workflows resolve the next version as the highest strict-`X.Y.Z` tag in the service's ECR repo (image or `charts/<name>` OCI) plus one, then probe-and-bump past any existing candidate (ECR tags are immutable). Git tags are never read for versioning.
+- **Release marker refs**: `refs/releases/image/<name>` and `refs/releases/chart/<name>` — one mutable ref per service, force-advanced to the released SHA on every successful push. They are the change-detection baseline for `discover-services` and chart-release's prepare job (legacy `image|chart/<name>/X.Y.Z` tag is the fallback until a service releases once with the marker in place). Not tags, so they don't feed Kargo's tag enumeration or the GitHub `create` webhook. Readers must fetch them explicitly (`+refs/releases/*:refs/releases/*`).
+- Per-service image tag: `image/<name>/X.Y.Z` (immutable git tag, pushed after successful ECR push). **Legacy mirror** — still minted only because Dispatch correlates on the `create` webhook; goes away once Dispatch is notified directly (#1201 dependency 2).
+- Per-chart tag: `chart/<name>/X.Y.Z` — same legacy status.
+- Per-service config tag (Kargo freight for `<svc>-config` Warehouse): `vX.Y.Z+<svc>` — semver **build metadata** form (`+`), not pre-release (`-`). The `+` form passes `semverConstraint: ">=0.0.0"` cleanly; the pre-release form would require `>=0.0.0-0`. **This tag family stays** — it is genuine Kargo freight.
 
-Both release workflows have a **recovery loop**: if a version exists in ECR but no matching git tag (prior partial run), they reclaim it by tagging then bumping patch. Don't simplify this away.
-
-Pinpoint (our deploy correlator) hooks the GitHub `create` webhook on `image/<name>/*` tags — keep the tag format stable.
+Pinpoint/Dispatch (our deploy correlator) hooks the GitHub `create` webhook on `image/<name>/*` tags — keep the tag format stable until the direct CI→Dispatch notification lands.
 
 ### `tag-config.yml` → platform-gitops dispatch
 

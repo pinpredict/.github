@@ -3,12 +3,14 @@ name: Helm Chart Release
 # Reusable matrix-based Helm chart release.
 #
 # Auto-discovers charts under `charts/*/`. For each chart:
-#   - Computes the next `chart/<name>/X.Y.Z` tag.
-#   - Skips charts unchanged since their last release tag (unless
-#     workflow_dispatch forced a release).
-#   - Packages, pushes to ECR OCI, tags, contributes to one aggregated
-#     GitHub Release. Bumps past versions that already exist in ECR
-#     (immutable) — recovers stranded versions from prior partial runs.
+#   - Skips charts unchanged since their last release (baseline =
+#     refs/releases/chart/<name> marker ref, legacy chart/<name>/X.Y.Z
+#     tag as fallback) unless workflow_dispatch forced a release.
+#   - Resolves the next version from the ECR OCI repo (highest X.Y.Z
+#     tag + 1 — the artifact store is the version record,
+#     platform-gitops#1201), packages, pushes, advances the marker ref,
+#     mints the legacy git tag, contributes to one aggregated GitHub
+#     Release.
 #
 # Caller has no inputs; auto-discovery handles everything. Each repo's
 # `ci.yml` decides whether to call this workflow.
@@ -38,7 +40,7 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
 
-      - name: Discover charts and compute candidate versions
+      - name: Discover charts needing release
         id: set
         run: |
           set -euo pipefail
@@ -62,35 +64,41 @@ jobs:
             fi
           }
 
+          # Change-detection baselines live in per-chart marker refs
+          # (refs/releases/chart/<name>, advanced by the package job on
+          # each successful push — platform-gitops#1201). Not tags, so
+          # checkout's fetch-tags does not bring them in. Version
+          # resolution happens in the package job: ECR is the version
+          # record and this job has no AWS credentials.
+          git fetch --quiet origin '+refs/releases/*:refs/releases/*' || true
+
           for chart_dir in charts/*/; do
             [ -f "${chart_dir}Chart.yaml" ] || continue
             name=$(grep '^name:' "${chart_dir}Chart.yaml" | awk '{print $2}')
 
-            prefix="chart/${name}/"
-            latest=$(git tag --list "${prefix}*" --sort=-v:refname \
-              | grep -E "^chart/${name}/[0-9]+\.[0-9]+\.[0-9]+$" | head -n1 || true)
-
-            if [ -z "$latest" ]; then
-              candidate="0.0.1"
+            base=""
+            if git rev-parse -q --verify "refs/releases/chart/${name}" >/dev/null; then
+              base="refs/releases/chart/${name}"
             else
-              version="${latest#"${prefix}"}"
-              IFS='.' read -r major minor patch <<< "$version"
-              candidate="${major}.${minor}.$((patch + 1))"
+              # Legacy fallback until the chart has released once with
+              # the marker ref in place.
+              base=$(git tag --list "chart/${name}/*" --sort=-v:refname \
+                | grep -E "^chart/${name}/[0-9]+\.[0-9]+\.[0-9]+$" | head -n1 || true)
             fi
 
             # Skip unchanged charts unless dispatch forced a release
-            if [ "$force" != "true" ] && [ -n "$latest" ]; then
-              changed=$(git diff --name-only "${latest}..HEAD" -- "${chart_dir}" || true)
+            if [ "$force" != "true" ] && [ -n "$base" ]; then
+              changed=$(git diff --name-only "${base}..HEAD" -- "${chart_dir}" || true)
               if [ -z "$changed" ]; then
-                echo "${name}: no changes since ${latest} — skipping"
+                echo "${name}: no changes since ${base} — skipping"
                 continue
               fi
             fi
 
-            echo "${name}: candidate ${candidate}"
+            echo "${name}: will release"
             dir="${chart_dir%/}"
             role=$(per_service_role "$name")
-            entries+=("{\"name\":\"${name}\",\"dir\":\"${dir}\",\"version\":\"${candidate}\",\"role\":\"${role}\"}")
+            entries+=("{\"name\":\"${name}\",\"dir\":\"${dir}\",\"role\":\"${role}\"}")
           done
 
           if [ ${#entries[@]} -eq 0 ]; then
@@ -183,32 +191,36 @@ jobs:
         env:
           NAME: ${{ matrix.name }}
           DIR: ${{ matrix.dir }}
-          CANDIDATE: ${{ matrix.version }}
         run: |
           set -euo pipefail
-          IFS='.' read -r major minor patch <<< "$CANDIDATE"
 
-          # Bump past versions already in ECR (immutable). Recover
-          # stranded ECR pushes that lost their git tag.
-          while true; do
-            version="${major}.${minor}.${patch}"
-            tag="chart/${NAME}/${version}"
+          # The ECR OCI repo is the version record: next version is a
+          # patch bump of the highest X.Y.Z tag already pushed. Git tags
+          # are a legacy mirror, still minted below for deploy
+          # correlation but no longer read (platform-gitops#1201). A
+          # missing repo or an empty tag list both mean first release.
+          latest=$(aws ecr describe-images \
+            --repository-name "charts/${NAME}" \
+            --filter tagStatus=TAGGED \
+            --query 'imageDetails[].imageTags[]' --output text 2>/dev/null \
+            | tr '[:space:]' '\n' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
+            | sort -V | tail -n1 || true)
 
-            if git tag --list "$tag" | grep -q .; then
-              echo "Git tag ${tag} already exists — bumping"
-              patch=$((patch + 1))
-              continue
-            fi
+          if [ -z "$latest" ]; then
+            major=0; minor=0; patch=0
+          else
+            IFS='.' read -r major minor patch <<< "$latest"
+          fi
+          patch=$((patch + 1))
 
-            if helm show chart "oci://${ECR_REGISTRY}/charts/${NAME}" --version "${version}" >/dev/null 2>&1; then
-              echo "::warning::Chart ${NAME}:${version} exists in ECR but no git tag — recovering"
-              git tag "$tag"
-              git push origin "$tag" || echo "::warning::Recovery tag push failed for ${tag}"
-              patch=$((patch + 1))
-              continue
-            fi
-
-            break
+          # ECR chart versions are immutable — probe-and-bump past any
+          # candidate that already exists (covers races that slip the
+          # workflow concurrency group and repos with gaps above the
+          # max semver).
+          while helm show chart "oci://${ECR_REGISTRY}/charts/${NAME}" \
+              --version "${major}.${minor}.${patch}" >/dev/null 2>&1; do
+            echo "Chart ${NAME}:${major}.${minor}.${patch} exists in ECR — bumping"
+            patch=$((patch + 1))
           done
           version="${major}.${minor}.${patch}"
           tag="chart/${NAME}/${version}"
@@ -239,6 +251,13 @@ jobs:
             echo "::error::Git tag push failed after 3 attempts for ${tag} — chart already in ECR!"
             exit 1
           fi
+
+          # Advance the per-chart release marker — one mutable ref, not
+          # a tag, so it is invisible to Kargo's tag enumeration and the
+          # GitHub create-webhook. The prepare job diffs against it to
+          # decide whether the chart needs a release.
+          git push --force origin "${GITHUB_SHA}:refs/releases/chart/${NAME}" \
+            || echo "::warning::Marker ref push failed for refs/releases/chart/${NAME} — next run falls back to the legacy tag baseline"
 
           mkdir -p release-info
           echo "${NAME} ${version}" > "release-info/${NAME}.txt"
