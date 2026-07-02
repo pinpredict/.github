@@ -21,11 +21,10 @@ name: Docker Release
 # store is the version record (platform-gitops#1201). Each successful
 # build pushes the image, advances the `refs/releases/image/<name>`
 # marker ref (the change-detection baseline for discover-services),
-# creates an immutable git tag `image/<name>/X.Y.Z`, and contributes to
-# a single aggregated GitHub Release at the end of the run. Dispatch
-# still correlates on the per-service git tags via the `create` webhook;
-# the tags and Releases go away once Dispatch is notified directly
-# (#1201 dependency 2).
+# and notifies Dispatch directly (signed POST via notify-dispatch;
+# the EventBridge ECR-push backstop covers a missed call). No git tags
+# or GitHub Releases are minted — the historical `image/<name>/X.Y.Z`
+# tags remain in repos as the frozen fallback baseline only.
 
 on:
   workflow_call:
@@ -119,7 +118,6 @@ jobs:
           BUILD_ARGS: ${{ matrix.build_args }}
           ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
           SHORT_SHA: ${{ github.sha }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # Empty unless private-modules minted a token above; gates the
           # BuildKit --secret so it's a no-op for every other caller.
           GH_PRIVATE_TOKEN: ${{ steps.private-module-token.outputs.token }}
@@ -129,10 +127,8 @@ jobs:
 
           # The ECR repo is the version record: next version is a patch
           # bump of the highest X.Y.Z tag already pushed (the -<sha>
-          # sibling tags are filtered out). Git tags are a legacy mirror,
-          # still minted below for deploy correlation but no longer read
-          # (platform-gitops#1201). A missing repo or an empty tag list
-          # both mean first release.
+          # sibling tags are filtered out). A missing repo or an empty
+          # tag list both mean first release.
           latest=$(aws ecr describe-images \
             --repository-name "${ECR_REPO}" \
             --filter tagStatus=TAGGED \
@@ -157,7 +153,6 @@ jobs:
             patch=$((patch + 1))
           done
           version="${major}.${minor}.${patch}"
-          tag="image/${NAME}/${version}"
 
           echo "Building ${ECR_REPO} v${version} from ${DOCKERFILE}${TARGET:+ (target=${TARGET})}"
 
@@ -204,25 +199,6 @@ jobs:
 
           docker buildx build "${buildx_args[@]}" .
 
-          # Tag immediately after successful push (retry up to 3 times).
-          # If the tag push fails permanently the image is in ECR with no
-          # git tag — the next run's recovery loop will reclaim it.
-          git tag "$tag"
-          tag_pushed=false
-          for attempt in 1 2 3; do
-            if git push origin "$tag"; then
-              tag_pushed=true
-              break
-            fi
-            echo "::warning::Git tag push attempt ${attempt}/3 failed for ${tag}"
-            sleep 2
-          done
-
-          if [ "$tag_pushed" != true ]; then
-            echo "::error::Git tag push failed after 3 attempts for ${tag} — image already in ECR!"
-            exit 1
-          fi
-
           # Advance the per-service release marker — one mutable ref,
           # not a tag, so it is invisible to Kargo's tag enumeration and
           # the GitHub create-webhook. discover-services diffs against
@@ -230,14 +206,11 @@ jobs:
           git push --force origin "${GITHUB_SHA}:refs/releases/image/${NAME}" \
             || echo "::warning::Marker ref push failed for refs/releases/image/${NAME} — next run falls back to the legacy tag baseline"
 
-          mkdir -p release-info
-          echo "${NAME} ${version}" > "release-info/${NAME}.txt"
           echo "version=${version}" >> "$GITHUB_OUTPUT"
 
-      # Direct publish signal to Dispatch (platform-gitops#1201) — the
-      # replacement for the create-webhook on the legacy git tag. Never
-      # fails the release; the EventBridge ECR-push backstop covers a
-      # missed notification.
+      # The publish signal (platform-gitops#1201). Never fails the
+      # release; the EventBridge ECR-push backstop covers a missed
+      # notification.
       - name: Notify Dispatch
         if: steps.release.outcome == 'success'
         uses: pinpredict/.github/actions/notify-dispatch@main
@@ -247,53 +220,15 @@ jobs:
           version: ${{ steps.release.outputs.version }}
           secret: ${{ secrets.CI_WEBHOOK_SECRET }}
 
-      - name: Upload release info
-        if: steps.release.outcome == 'success'
-        uses: actions/upload-artifact@v7
-        with:
-          name: release-info-${{ matrix.name }}
-          path: release-info/${{ matrix.name }}.txt
-          retention-days: 1
-
+  # Kept as the aggregate fail-gate (stable check name for branch
+  # protection). The GitHub release it used to create was keyed off the
+  # legacy image/* git tag; Dispatch's Slack cards carry the per-service
+  # changelog now (platform-gitops#1201).
   release-summary:
     needs: build
     if: ${{ !cancelled() && needs.build.result != 'skipped' }}
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    env:
-      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@v6
-
-      - name: Download release-info artifacts
-        uses: actions/download-artifact@v7
-        with:
-          path: release-info
-          pattern: release-info-*
-          merge-multiple: true
-
-      - name: Create aggregated GitHub release
-        run: |
-          set -euo pipefail
-          shopt -s nullglob
-          released=()
-          for f in release-info/*.txt; do
-            released+=("$(cat "$f")")
-          done
-
-          if [ ${#released[@]} -eq 0 ]; then
-            echo "No services were released."
-            exit 0
-          fi
-
-          title="Release: $(IFS=', '; echo "${released[*]}")"
-          first_name="${released[0]%% *}"
-          first_ver="${released[0]##* }"
-          gh release create "image/${first_name}/${first_ver}" \
-            --generate-notes \
-            --title "$title"
-
       - name: Fail if any build failed
         if: needs.build.result != 'success'
         run: |
