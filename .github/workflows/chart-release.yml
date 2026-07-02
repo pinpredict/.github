@@ -233,6 +233,23 @@ jobs:
           helm package "${DIR}"
           helm push "${NAME}-${version}.tgz" "oci://${ECR_REGISTRY}/charts"
 
+          # Alias the pushed chart with a sha-suffixed tag. Dispatch's
+          # ECR-push backstop recovers commit provenance only from an
+          # X.Y.Z-<sha7> tag (platform-gitops#1201); a plain-version
+          # event carries no commit and is ignored. Repo immutability
+          # blocks re-pushing existing tags but allows aliasing the
+          # same manifest under a new one. Warn-only: without the
+          # alias the direct CI notification below still covers the
+          # release.
+          SHORT_SHA="${GITHUB_SHA:0:7}"
+          manifest=$(aws ecr batch-get-image --repository-name "charts/${NAME}" \
+            --image-ids imageTag="${version}" \
+            --query 'images[0].imageManifest' --output text)
+          aws ecr put-image --repository-name "charts/${NAME}" \
+            --image-tag "${version}-${SHORT_SHA}" \
+            --image-manifest "$manifest" >/dev/null \
+            || echo "::warning::sha alias tag failed for charts/${NAME}:${version}-${SHORT_SHA}"
+
           # Tag immediately after successful push (retry up to 3 times).
           # If permanent failure the chart sits in ECR with no git tag —
           # the next run's recovery loop will reclaim it.
@@ -261,6 +278,20 @@ jobs:
 
           mkdir -p release-info
           echo "${NAME} ${version}" > "release-info/${NAME}.txt"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      # Direct publish signal to Dispatch (platform-gitops#1201) — the
+      # replacement for the create-webhook on the legacy git tag. Never
+      # fails the release; the EventBridge ECR-push backstop covers a
+      # missed notification.
+      - name: Notify Dispatch
+        if: steps.release.outcome == 'success'
+        uses: pinpredict/.github/actions/notify-dispatch@main
+        with:
+          kind: chart
+          service: ${{ matrix.name }}
+          version: ${{ steps.release.outputs.version }}
+          secret: ${{ secrets.CI_WEBHOOK_SECRET }}
 
       - name: Upload release info
         if: steps.release.outcome == 'success'
