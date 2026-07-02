@@ -202,14 +202,24 @@ jobs:
           # same manifest under a new one. Warn-only: without the
           # alias the direct CI notification below still covers the
           # release.
+          # put-image needs the media type passed explicitly: helm's OCI
+          # manifests omit the optional top-level mediaType field, and
+          # without it ECR rejects the manifest with a misleading
+          # "Invalid JSON syntax". jq -j keeps the manifest byte-exact
+          # (a trailing newline changes the digest and ECR stores a
+          # second image instead of aliasing); -e fails the pipeline on
+          # a null lookup instead of passing the literal "null" on.
           SHORT_SHA="${GITHUB_SHA:0:7}"
-          manifest=$(aws ecr batch-get-image --repository-name "charts/${NAME}" \
-            --image-ids imageTag="${version}" \
-            --query 'images[0].imageManifest' --output text)
-          aws ecr put-image --repository-name "charts/${NAME}" \
-            --image-tag "${version}-${SHORT_SHA}" \
-            --image-manifest "$manifest" >/dev/null \
-            || echo "::warning::sha alias tag failed for charts/${NAME}:${version}-${SHORT_SHA}"
+          {
+            aws ecr batch-get-image --repository-name "charts/${NAME}" \
+              --image-ids imageTag="${version}" --output json \
+              | jq -ej '.images[0].imageManifest' > manifest.json
+            aws ecr put-image --repository-name "charts/${NAME}" \
+              --image-tag "${version}-${SHORT_SHA}" \
+              --image-manifest "file://manifest.json" \
+              --image-manifest-media-type "application/vnd.oci.image.manifest.v1+json" \
+              >/dev/null
+          } || echo "::warning::sha alias tag failed for charts/${NAME}:${version}-${SHORT_SHA}"
 
           # Tag immediately after successful push (retry up to 3 times).
           # If permanent failure the chart sits in ECR with no git tag —
