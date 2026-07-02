@@ -9,11 +9,40 @@ description: |
   caller doesn't pin Go in two places — bumping `go x.yy.z` in go.mod
   drives CI.
 
+  Optional `private-modules: true` mints a short-lived, read-only
+  pinpredict-argocd App token and configures git + GOPRIVATE so `go`,
+  `golangci-lint`, and `goreleaser` can fetch a private pinpredict module
+  (e.g. github.com/pinpredict/ppkit) without committing a vendor/ tree.
+  This is the non-Docker analogue of docker-release.yml's `private-modules`
+  BuildKit secret. Default false — a no-op for every existing caller.
+
 inputs:
   go-version-file:
     description: "Path to go.mod (or any file with a `go` directive)."
     required: false
     default: "go.mod"
+  private-modules:
+    description: >-
+      When true, mint a read-only pinpredict-argocd App token from
+      private-modules-app-id / private-modules-app-private-key and configure
+      git (a scheme-scoped `insteadOf` for github.com/pinpredict/) plus
+      GOPRIVATE, so Go tooling fetches private pinpredict modules over HTTPS
+      instead of failing on the public proxy. Default false.
+    required: false
+    default: "false"
+  private-modules-app-id:
+    description: >-
+      App ID for the private-module read token (the org secret
+      BOOTSTRAP_APP_ID — the pinpredict-argocd App). Required when
+      private-modules is true.
+    required: false
+    default: ""
+  private-modules-app-private-key:
+    description: >-
+      App private key for the private-module read token (the org secret
+      BOOTSTRAP_APP_PRIVATE_KEY). Required when private-modules is true.
+    required: false
+    default: ""
 
 runs:
   using: composite
@@ -22,3 +51,34 @@ runs:
       uses: actions/setup-go@v6
       with:
         go-version-file: ${{ inputs.go-version-file }}
+
+    # Opt-in (private-modules: true): mint a short-lived, read-only token for
+    # the org-wide pinpredict-argocd App so `go mod download` / golangci /
+    # goreleaser can fetch private pinpredict modules without a vendor/ tree.
+    # Skipped entirely (no token, no git rewrite) for every caller that leaves
+    # private-modules at its default false.
+    - name: Mint private-module read token
+      id: private-module-token
+      if: ${{ inputs.private-modules == 'true' }}
+      uses: actions/create-github-app-token@v1
+      with:
+        app-id: ${{ inputs.private-modules-app-id }}
+        private-key: ${{ inputs.private-modules-app-private-key }}
+        owner: pinpredict
+        permission-contents: read
+
+    - name: Configure private-module fetch
+      if: ${{ inputs.private-modules == 'true' }}
+      shell: bash
+      env:
+        GH_PRIVATE_TOKEN: ${{ steps.private-module-token.outputs.token }}
+      run: |
+        set -euo pipefail
+        # Rewrite only pinpredict HTTPS remotes to carry the minted token; the
+        # token is org-scoped and read-only, and the rewrite is limited to our
+        # org so it never leaks onto unrelated github.com fetches.
+        git config --global \
+          url."https://x-access-token:${GH_PRIVATE_TOKEN}@github.com/pinpredict/".insteadOf \
+          "https://github.com/pinpredict/"
+        # GOPRIVATE keeps these modules off the public proxy + checksum DB.
+        echo "GOPRIVATE=github.com/pinpredict/*" >> "$GITHUB_ENV"
