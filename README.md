@@ -10,8 +10,8 @@ Why `.github` and not a dedicated `github-actions` repo: `.github` is *the* GitH
 
 | File | Purpose |
 |---|---|
-| `docker-release.yml` | Matrix-based image build + push to ECR; per-service `image/<name>/X.Y.Z` git tags; aggregated GitHub Release. Caller passes a `matrix` input in the standard `{include:[...]}` shape. |
-| `chart-release.yml` | Auto-discovers `charts/*/`, bumps versions, packages, pushes to ECR OCI, tags `chart/<name>/X.Y.Z`. No caller inputs. |
+| `docker-release.yml` | Matrix-based image build + push to ECR. Version = highest `X.Y.Z` tag in the ECR repo + 1 (ECR is the version record — platform-gitops#1201); advances the `refs/releases/image/<name>` marker ref, mints the legacy `image/<name>/X.Y.Z` git tag (Dispatch correlation, being phased out), aggregated GitHub Release. Caller passes a `matrix` input in the standard `{include:[...]}` shape. |
+| `chart-release.yml` | Auto-discovers `charts/*/`, skips charts unchanged since their `refs/releases/chart/<name>` marker ref, resolves the next version from the ECR OCI repo, packages, pushes, advances the marker, mints the legacy `chart/<name>/X.Y.Z` tag. No caller inputs. |
 | `tag-config.yml` | Tags merges to main that touch `.platform/services/<svc>.yaml` with `vX.Y.Z+<svc>` (per-service Kargo `<svc>-config` Warehouse freight), then dispatches `service-config-tag` to platform-gitops so missing pointer files get seeded. |
 | `actionlint.yml` | Lints GitHub Actions workflow YAML with [`actionlint`](https://github.com/rhysd/actionlint) at a pinned version. Self-runs on this repo when PRs/pushes touch `.github/workflows/**` or `actions/**/action.yml`; callers reuse it via `uses: pinpredict/.github/.github/workflows/actionlint.yml@main`. |
 
@@ -19,7 +19,7 @@ Why `.github` and not a dedicated `github-actions` repo: `.github` is *the* GitH
 
 | Action | Purpose |
 |---|---|
-| `discover-services` | Reads `.platform/services/*.yaml` and emits a docker matrix of services whose docker-relevant files changed since their last `image/<name>/*` tag. Also emits `charts_changed`. |
+| `discover-services` | Reads `.platform/services/*.yaml` and emits a docker matrix of services whose docker-relevant files changed since their last release (baseline = `refs/releases/image/<name>` marker ref; legacy `image/<name>/*` tag fallback). Also emits `charts_changed`. |
 | `validate-platform-service` | Pre-merge static + render check for added/modified `.platform/services/*.yaml`. Renders each via `charts/service-template` for every env in `environments[]` with all `renderXxx` flags forced on; verifies `repositories.chart` resolves to a real `charts/<x>/Chart.yaml`. Closes the gap from platform-gitops#544 — every dis-opticodds-props-streamer failure mode would have failed CI here. |
 | `validate-reusable-inputs` | Cross-repo input validation for callers of `pinpredict/.github` reusable workflows. Diffs every `with:` block against the referenced workflow's `on.workflow_call.inputs` map; fails on unknown keys or missing-required keys. Closes the gap left by stock `actionlint`, which can't fetch remote reusable workflows (platform-gitops#1045). Runs automatically as a sibling job in `actionlint.yml`, so any consumer that already `uses:` that reusable workflow inherits it. |
 | `setup-python-uv` | Install uv + a pinned Python version + (default-on) `uv sync`. |
