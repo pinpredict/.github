@@ -1,0 +1,68 @@
+name: Configure AWS credentials (with role-propagation retry)
+description: |
+  Wrap aws-actions/configure-aws-credentials in a three-shot retry to
+  tolerate a first-colocation race with Crossplane minting the target
+  per-service push role.
+
+  AssumeRole on a per-service xp-<svc>-gha-push role can race with
+  Crossplane creating that role for the first time. Observed in
+  pinpredict/trading#616: the release workflow ran at 04:50:53 UTC and
+  `Not authorized to perform sts:AssumeRoleWithWebIdentity` came back;
+  the Crossplane composition created the role at 04:50:55, two seconds
+  too late. AccessDenied is non-retryable inside
+  aws-actions/configure-aws-credentials, so the action's built-in
+  backoff gives up after ~50s before the role exists.
+
+  Three-shot pattern: try, sleep 30, retry, sleep 60, retry. Only the
+  final attempt's failure is fatal. Zero added time on the steady-state
+  path (first attempt succeeds); bounded ~90s on a first-colocation
+  race.
+
+  Shared by chart-release.yml and docker-release.yml, which both assume
+  a freshly-minted per-service role.
+
+inputs:
+  role-to-assume:
+    description: "IAM role ARN to assume via OIDC (the per-service xp-<svc>-gha-push role, or the central fallback)."
+    required: true
+  aws-region:
+    description: "AWS region to configure."
+    required: false
+    default: "us-east-1"
+
+runs:
+  using: composite
+  steps:
+    - name: Configure AWS credentials (attempt 1)
+      id: aws-attempt-1
+      uses: aws-actions/configure-aws-credentials@v6
+      continue-on-error: true
+      with:
+        role-to-assume: ${{ inputs.role-to-assume }}
+        aws-region: ${{ inputs.aws-region }}
+
+    - name: Wait for IAM role propagation (attempt 1 failed)
+      if: steps.aws-attempt-1.outcome == 'failure'
+      shell: bash
+      run: sleep 30
+
+    - name: Configure AWS credentials (attempt 2)
+      id: aws-attempt-2
+      if: steps.aws-attempt-1.outcome == 'failure'
+      uses: aws-actions/configure-aws-credentials@v6
+      continue-on-error: true
+      with:
+        role-to-assume: ${{ inputs.role-to-assume }}
+        aws-region: ${{ inputs.aws-region }}
+
+    - name: Wait for IAM role propagation (attempt 2 failed)
+      if: steps.aws-attempt-2.outcome == 'failure'
+      shell: bash
+      run: sleep 60
+
+    - name: Configure AWS credentials (attempt 3, fatal)
+      if: steps.aws-attempt-2.outcome == 'failure'
+      uses: aws-actions/configure-aws-credentials@v6
+      with:
+        role-to-assume: ${{ inputs.role-to-assume }}
+        aws-region: ${{ inputs.aws-region }}
