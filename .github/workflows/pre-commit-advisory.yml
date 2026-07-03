@@ -71,20 +71,32 @@ jobs:
         with:
           fetch-depth: 0
 
+      # Python is still needed for `language: python` hooks (ruff, …) —
+      # go-pre-commit builds their venvs with the interpreter on PATH.
       - uses: actions/setup-python@v6
         with:
           python-version: ${{ inputs.python-version }}
 
+      # Key prefix is go-pre-commit-* so envs built by the old Python
+      # pre-commit are never restored into the Go implementation.
       - name: Cache pre-commit hook envs
         uses: actions/cache@v6
         with:
           path: ~/.cache/pre-commit
-          key: pre-commit-${{ runner.os }}-py${{ inputs.python-version }}-${{ hashFiles('.pre-commit-config.yaml') }}
+          key: go-pre-commit-${{ runner.os }}-py${{ inputs.python-version }}-${{ hashFiles('.pre-commit-config.yaml') }}
           restore-keys: |
-            pre-commit-${{ runner.os }}-py${{ inputs.python-version }}-
+            go-pre-commit-${{ runner.os }}-py${{ inputs.python-version }}-
 
-      - name: Install pre-commit
-        run: pip install --upgrade pip pre-commit
+      # go-pre-commit (github.com/blairham/go-pre-commit) — drop-in Go
+      # reimplementation of pre-commit; no pip install. install-only: this
+      # workflow drives pre-commit itself (diff-scoped run below + the
+      # install-hooks cache seed), and the cache step above owns caching.
+      - name: Install go-pre-commit
+        uses: blairham/go-pre-commit@main
+        with:
+          version: v4.5.4
+          install-only: 'true'
+          cache: 'false'
 
       # Hooks with `language: golang` (the upstream golangci-lint hooks) are
       # built by pre-commit with whatever `go` is on PATH. The runner's
