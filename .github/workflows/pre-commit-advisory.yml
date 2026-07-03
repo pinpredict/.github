@@ -86,6 +86,30 @@ jobs:
       - name: Install pre-commit
         run: pip install --upgrade pip pre-commit
 
+      # Hooks with `language: golang` (the upstream golangci-lint hooks) are
+      # built by pre-commit with whatever `go` is on PATH. The runner's
+      # preinstalled Go can lag the repos' targeted version, and a
+      # golangci-lint built with an older toolchain refuses to load a config
+      # targeting a newer one ("the Go language version used to build
+      # golangci-lint is lower than the targeted Go version"). Pin GOTOOLCHAIN
+      # to the highest `go` directive found in the repo so the go command
+      # auto-provisions that toolchain for the hook builds. No-op for repos
+      # without a go.mod. Only full X.Y.Z directives are pinned — a bare
+      # major.minor can't name a toolchain.
+      - name: Pin Go toolchain for golang hooks
+        run: |
+          ver=$(find . -name go.mod -not -path '*/vendor/*' -not -path '*/node_modules/*' \
+            -exec awk '/^go [0-9]/{print $2}' {} + | sort -V | tail -1)
+          case "$ver" in
+            *.*.*)
+              echo "GOTOOLCHAIN=go${ver}" >> "$GITHUB_ENV"
+              echo "Pinned GOTOOLCHAIN=go${ver}"
+              ;;
+            *)
+              echo "No full X.Y.Z go directive found (got '${ver:-none}') — leaving GOTOOLCHAIN unset"
+              ;;
+          esac
+
       # Optional: install .NET SDK + restore local tools (csharpier, etc).
       # setup-dotnet@v5 caches the SDK by version across runs.
       - name: Set up .NET
