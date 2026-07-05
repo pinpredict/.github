@@ -58,11 +58,11 @@ on:
         description: "stevedore release to use."
         required: false
         type: string
-        # v0.0.4 = plan/matrix mode + --only/--pin-version. Bump to v0.0.5
-        # when blairham/stevedore#8 (skip empty cache entries) is released —
-        # required only for LOCAL builds of cache-wired configs; in CI the
-        # cache env below renders the entries non-empty either way.
-        default: "v0.0.4"
+        # v0.0.5 = plan/matrix mode (v0.0.4) + skip-empty cache entries
+        # (blairham/stevedore#8), which keeps LOCAL builds of cache-wired
+        # configs working; in CI the cache env below renders the entries
+        # non-empty either way.
+        default: "v0.0.5"
 
 env:
   AWS_REGION: us-east-1
@@ -115,7 +115,7 @@ jobs:
       - name: Stevedore
         # uses: refs cannot be expressions — pin the action; the `version`
         # input below selects the binary that actually runs.
-        uses: blairham/stevedore@v0.0.4
+        uses: blairham/stevedore@v0.0.5
         env:
           # ECR host, e.g. 123456789.dkr.ecr.us-east-1.amazonaws.com — the
           # .stevedore.yaml repositories template this as {{ .Env.REGISTRY }}.
