@@ -54,6 +54,11 @@ on:
         required: false
         type: boolean
         default: false
+      only:
+        description: "Comma-separated image ids to release (stevedore --only); empty releases per change detection. Feeds workflow_dispatch service pickers."
+        required: false
+        type: string
+        default: ""
       parallel:
         description: "Build up to N images concurrently."
         required: false
@@ -106,11 +111,13 @@ jobs:
           NO_PUSH: ${{ inputs.no-push }}
           PARALLEL: ${{ inputs.parallel }}
           CHANGED_SINCE: ${{ inputs.changed-since }}
+          ONLY: ${{ inputs.only }}
         run: |
           set -euo pipefail
           args="--parallel ${PARALLEL}"
           [ "${NO_PUSH}" = "true" ] && args="${args} --no-push"
           [ -n "${CHANGED_SINCE}" ] && args="${args} --changed-since ${CHANGED_SINCE}"
+          [ -n "${ONLY}" ] && args="${args} --only ${ONLY}"
           echo "value=${args}" >> "$GITHUB_OUTPUT"
 
       # buildx's type=gha cache backend reads ACTIONS_CACHE_URL /
