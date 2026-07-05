@@ -10,7 +10,7 @@ Why `.github` and not a dedicated `github-actions` repo: `.github` is *the* GitH
 
 | File | Purpose |
 |---|---|
-| `docker-release.yml` | Image build + release via [stevedore](https://github.com/blairham/stevedore), driven by the caller repo's `.stevedore.yaml` — **no `matrix` input**. Single job by design (pinpredict/.github#39): one runner + one BuildKit, so a build-once Dockerfile compiles once for every image. Version = highest `X.Y.Z` tag in the ECR repo + 1 (ECR is the version record — platform-gitops#1201, resolved by stevedore); advances the `refs/releases/image/<id>` marker refs. No git tags or GitHub Releases. Exports `STEVEDORE_CACHE_FROM/TO` (one `type=gha` scope) for configs that opt into layer caching. `no-push` defaults `true` until the Dispatch notification gap (blairham/stevedore#6) closes. Existing callers are pinned to `@pre-stevedore` (the frozen matrix implementation, which also carried the `private-modules` BuildKit-secret input) — see the tagging exception below. |
+| `docker-release.yml` | Image build + release via [stevedore](https://github.com/blairham/stevedore), driven by the caller repo's `.stevedore.yaml` — **no `matrix` input**. Single job by design (pinpredict/.github#39): one runner + one BuildKit, so a build-once Dockerfile compiles once for every image. Version = highest `X.Y.Z` tag in the ECR repo + 1 (ECR is the version record — platform-gitops#1201, resolved by stevedore); advances the `refs/releases/image/<id>` marker refs. No git tags or GitHub Releases. Exports `STEVEDORE_CACHE_FROM/TO` (one `type=gha` scope) for configs that opt into layer caching. Notifies Dispatch once per **pushed** image from stevedore's release summary (`no-push` builds notify nothing). Existing callers are pinned to `@pre-stevedore` (the frozen matrix implementation, which also carried the `private-modules` BuildKit-secret input) — see the tagging exception below. |
 | `chart-release.yml` | Auto-discovers `charts/*/`, skips charts unchanged since their `refs/releases/chart/<name>` marker ref, resolves the next version from the ECR OCI repo, packages, pushes (+ `X.Y.Z-<sha7>` provenance alias), advances the marker, notifies Dispatch. No git tags or GitHub Releases. No caller inputs. |
 | `tag-config.yml` | Tags merges to main that touch `.platform/services/<svc>.yaml` with `vX.Y.Z+<svc>` (per-service Kargo `<svc>-config` Warehouse freight), then dispatches `service-config-tag` to platform-gitops so missing pointer files get seeded. |
 | `actionlint.yml` | Lints GitHub Actions workflow YAML with [`actionlint`](https://github.com/rhysd/actionlint) at a pinned version. Self-runs on this repo when PRs/pushes touch `.github/workflows/**` or `actions/**/action.yml`; callers reuse it via `uses: pinpredict/.github/.github/workflows/actionlint.yml@main`. |
@@ -19,7 +19,7 @@ Why `.github` and not a dedicated `github-actions` repo: `.github` is *the* GitH
 
 | Action | Purpose |
 |---|---|
-| `notify-dispatch` | POSTs a signed publish notification (service, version, SHA, run URL) to Dispatch's public `/dispatch/ci` route after a successful ECR push. Called by both release workflows; warn-only on failure (the EventBridge ECR-push backstop covers a missed call). |
+| `notify-dispatch` | POSTs a signed publish notification (service, version, SHA, run URL) to Dispatch's public `/dispatch/ci` route after a successful ECR push — one call per artifact, or a `batch` JSON array (used by docker-release's stevedore summary). Called by both release workflows; warn-only on failure (the EventBridge ECR-push backstop covers a missed call). |
 | `configure-aws-with-retry` | Wraps `aws-actions/configure-aws-credentials` in a three-shot retry (try / sleep 30 / retry / sleep 60 / retry) to survive a first-colocation race with Crossplane minting the per-service `xp-<svc>-gha-push` role (pinpredict/trading#616). Inputs: `role-to-assume` (required), `aws-region` (default `us-east-1`). Shared by both release workflows. |
 | `discover-services` | Reads `.platform/services/*.yaml` and emits a docker matrix of services whose docker-relevant files changed since their last release (baseline = `refs/releases/image/<name>` marker ref; legacy `image/<name>/*` tag fallback). Also emits `charts_changed`. |
 | `validate-platform-service` | Pre-merge static + render check for added/modified `.platform/services/*.yaml`. Renders each via `charts/service-template` for every env in `environments[]` with all `renderXxx` flags forced on; verifies `repositories.chart` resolves to a real `charts/<x>/Chart.yaml`. Closes the gap from platform-gitops#544 — every dis-opticodds-props-streamer failure mode would have failed CI here. |
@@ -141,7 +141,6 @@ jobs:
     uses: pinpredict/.github/.github/workflows/docker-release.yml@main
     with:
       changed-since: ${{ github.event.before }}
-      no-push: true # flip to false once the Dispatch notification lands
     secrets: inherit
 
   chart-release:

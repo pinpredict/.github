@@ -31,10 +31,10 @@ name: Docker Release
 # render empty (and are skipped, stevedore >= v0.0.5) outside CI so local
 # builds are unaffected.
 #
-# Remaining gap vs the matrix implementation: no Dispatch publish notification
-# yet (blairham/stevedore#6) — the EventBridge ECR-push backstop still covers
-# deploy correlation. Callers should keep `no-push: true` (the default) or stay
-# on the pre-stevedore pin for real publishes until that is wired.
+# Dispatch publish notification: stevedore's release summary (a `summary` step
+# output since v0.0.6, blairham/stevedore#6) drives one notify-dispatch call
+# per PUSHED image after the release — behavior parity with the matrix
+# implementation. The EventBridge ECR-push backstop still covers a missed call.
 
 on:
   workflow_call:
@@ -50,10 +50,10 @@ on:
         type: string
         default: ""
       no-push:
-        description: "Build without pushing (validation only). Default true until the Dispatch notification gap closes."
+        description: "Build without pushing (validation only)."
         required: false
         type: boolean
-        default: true
+        default: false
       parallel:
         description: "Build up to N images concurrently."
         required: false
@@ -63,11 +63,10 @@ on:
         description: "stevedore release to use."
         required: false
         type: string
-        # v0.0.5 = plan/matrix mode (v0.0.4) + skip-empty cache entries
-        # (blairham/stevedore#8), which keeps LOCAL builds of cache-wired
-        # configs working; in CI the cache env below renders the entries
-        # non-empty either way.
-        default: "v0.0.5"
+        # v0.0.6 = skip-empty cache entries (v0.0.5, blairham/stevedore#8)
+        # + release summary with pushed/reason fields as a step output
+        # (blairham/stevedore#9) — the Notify Dispatch step consumes it.
+        default: "v0.0.6"
 
 env:
   AWS_REGION: us-east-1
@@ -122,9 +121,10 @@ jobs:
         uses: crazy-max/ghaction-github-runtime@v3
 
       - name: Stevedore
+        id: stevedore
         # uses: refs cannot be expressions — pin the action; the `version`
         # input below selects the binary that actually runs.
-        uses: blairham/stevedore@v0.0.5
+        uses: blairham/stevedore@v0.0.6
         env:
           # ECR host, e.g. 123456789.dkr.ecr.us-east-1.amazonaws.com — the
           # .stevedore.yaml repositories template this as {{ .Env.REGISTRY }}.
@@ -145,6 +145,28 @@ jobs:
           install-syft: "false"
           install-grype: "false"
 
+      # One publish notification per PUSHED image, from stevedore's release
+      # summary (platform-gitops#1201). pushed=false (a no-push validation
+      # build) and skipped entries notify nothing. Never fails the release —
+      # the EventBridge ECR-push backstop covers a missed call.
+      - name: Build Dispatch batch
+        id: dispatch-batch
+        if: ${{ steps.stevedore.outputs.summary != '' }}
+        env:
+          SUMMARY: ${{ steps.stevedore.outputs.summary }}
+        run: |
+          set -euo pipefail
+          batch=$(jq -c '[(.images // [])[] | select(.pushed and (.skipped | not)) | {kind: "image", service: .id, version: .version}]' <<<"${SUMMARY}")
+          echo "value=${batch}" >> "$GITHUB_OUTPUT"
+          echo "Pushed images to notify: $(jq -r 'length' <<<"${batch}")"
+
+      - name: Notify Dispatch
+        if: ${{ steps.dispatch-batch.outputs.value && steps.dispatch-batch.outputs.value != '[]' }}
+        uses: pinpredict/.github/actions/notify-dispatch@main
+        with:
+          batch: ${{ steps.dispatch-batch.outputs.value }}
+          secret: ${{ secrets.CI_WEBHOOK_SECRET }}
+
 # ── How a repo calls it ──────────────────────────────────────────────────────
 #
 # jobs:
@@ -153,5 +175,4 @@ jobs:
 #     uses: pinpredict/.github/.github/workflows/docker-release.yml@main
 #     with:
 #       changed-since: ${{ github.event.before }}   # or the PR base SHA
-#       no-push: true                                # flip to false to publish
 #     secrets: inherit
