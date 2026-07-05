@@ -57,7 +57,7 @@ It posts a sticky PR comment with hook output and fails the job (so engineers se
 - **Bumping action versions** (`actions/checkout`, `aws-actions/*`, etc.) — bump both workflows together if they share the action; mismatched versions across the two release workflows have caused subtle behavior splits before.
 - **Adding a new composite action** under `actions/`: add a row to the `## What's here` table in `README.md` and a usage block under `#### Language setup composites — usage` if it's a setup composite.
 - **Force `FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true`** is set on workflows that use older marketplace actions still pinned to Node 20 — leave it in place when copying steps.
-- **Hard rule**: do not pre-tag this repo with `@v1` / `@v2` selectively — README's stance is "fix forward on main, only tag if blast radius bites." Don't introduce version tags without explicit discussion.
+- **Hard rule**: do not pre-tag this repo with `@v1` / `@v2` selectively — README's stance is "fix forward on main, only tag if blast radius bites." Don't introduce version tags without explicit discussion. One sanctioned exception exists: the `pre-stevedore` tag, a frozen snapshot that `docker-release.yml` callers pin to while main migrates that workflow to stevedore (see README "How to use"). It is not maintained — never retarget it or backport fixes to it; the fix for a pinned caller is to finish its migration and unpin.
 
 ## Parent guidance
 
