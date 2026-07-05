@@ -95,10 +95,13 @@ jobs:
       - name: Configure AWS credentials
         uses: pinpredict/.github/actions/configure-aws-with-retry@main
         with:
-          # Single-job builds push every image under the central role. The
-          # per-service xp-<svc>-gha-push roles are a matrix-mode feature
-          # (stevedore plan + release --only) — see the workflow header.
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          # Single-job builds push every image under the caller repo's
+          # repo-level role xp-<repo>-gha-push (ECR push on the repo's
+          # image namespace), derived by convention; secrets.AWS_ROLE_ARN
+          # overrides when set. The per-service xp-<svc>-gha-push roles
+          # are a matrix-mode feature (stevedore plan + release --only) —
+          # see the workflow header.
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN || format('arn:aws:iam::784682930591:role/xp-{0}-gha-push', github.event.repository.name) }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Log in to Amazon ECR
