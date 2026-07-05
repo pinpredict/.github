@@ -68,7 +68,9 @@ Why `.github` and not a dedicated `github-actions` repo: `.github` is *the* GitH
 
 ## How to use
 
-Pin callers to `@main`. We own all consumers, so version pinning adds overhead without safety benefit at this team size — `@main` gives the "edit once, propagate everywhere" property that's the whole point of centralizing. If blast radius ever bites, we add a `@v1` tag selectively for the workflows that broke; we don't pre-tag everything.
+Pin callers to `@main`. We own all consumers, so version pinning adds overhead without safety benefit at this team size — `@main` gives the "edit once, propagate everywhere" property that's the whole point of centralizing. If blast radius ever bites, we add a tag selectively for the workflows that broke; we don't pre-tag everything.
+
+**Current exception — the `pre-stevedore` tag.** `docker-release.yml` is being rebuilt on [stevedore](https://github.com/blairham/stevedore), which is exactly the "blast radius bites" case the rule reserves. Callers of `docker-release.yml` (and only that workflow) are temporarily pinned to `@pre-stevedore`, a frozen snapshot of main — not a maintained version line, no fixes land on it. Everything else (chart-release, composites, tag-config) stays on `@main`. The pin comes off caller-by-caller as each repo migrates, and the tag is deleted when the migration completes.
 
 For workflows that touch secrets/OIDC, pin to an immutable SHA only if a security audit later requires it.
 
