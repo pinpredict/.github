@@ -1,52 +1,73 @@
 name: Docker Release
 
-# Reusable matrix-based image build/push.
+# Reusable image build/release via stevedore (https://github.com/blairham/stevedore).
 #
-# The caller owns the service catalog. It passes `matrix` as a JSON string
-# in the GitHub Actions matrix include shape:
+# This REPLACED the matrix-based implementation on main — that snapshot lives
+# on the frozen `pre-stevedore` tag, which every existing caller is pinned to.
+# The pin comes off caller-by-caller as each repo adds a `.stevedore.yaml` and
+# switches its `uses:` back to @main; the tag is deleted when the migration
+# completes (see README "How to use").
 #
-#   {
-#     "include": [
-#       {
-#         "name": "trader-tools",        # required: ECR repo basename + tag service segment
-#         "ecr_repo": "trader-tools",    # required: full ECR repo path (e.g. "trading/oms")
-#         "dockerfile": "Dockerfile",    # optional: defaults to "Dockerfile"
-#         "target": "production",        # optional: docker --target value
-#         "build_args": "KEY=VAL\nK2=V2" # optional: newline-separated --build-arg entries
-#       }
-#     ]
-#   }
+# Unlike the matrix implementation, the CALLER PASSES NO SERVICE MATRIX.
+# stevedore reads the repo's .stevedore.yaml, resolves per-service ECR versions
+# itself (`aws ecr describe-images`, highest X.Y.Z + bump — ECR stays the
+# version record, platform-gitops#1201), does change detection against the
+# `refs/releases/image/<id>` marker refs (the same family the matrix
+# implementation advanced — it fetches and re-pushes them itself), and builds
+# only the images whose sources changed. No git tags or GitHub Releases are
+# minted, same as before.
 #
-# Version resolution reads ECR (highest X.Y.Z tag + 1) — the artifact
-# store is the version record (platform-gitops#1201). Each successful
-# build pushes the image, advances the `refs/releases/image/<name>`
-# marker ref (the change-detection baseline for discover-services),
-# and notifies Dispatch directly (signed POST via notify-dispatch;
-# the EventBridge ECR-push backstop covers a missed call). No git tags
-# or GitHub Releases are minted — the historical `image/<name>/X.Y.Z`
-# tags remain in repos as the frozen fallback baseline only.
+# SINGLE JOB BY DESIGN (pinpredict/.github#39): all of a repo's images build on
+# one runner sharing one BuildKit instance, so a build-once Dockerfile (e.g.
+# trading#1967 — a shared compile stage with no per-image build args) compiles
+# ONCE and every image reuses it, even with --parallel (BuildKit dedups
+# identical in-flight stages). Fanning out per image (stevedore plan → matrix)
+# would give every image a cold cache and re-run the shared stage per runner —
+# only adopt matrix mode for repos whose images have nothing in common.
+#
+# Layer cache: exports STEVEDORE_CACHE_FROM/STEVEDORE_CACHE_TO (one type=gha
+# scope per calling repo — GHA cache is repo-scoped already). Configs opt in
+# per image with '{{ index .Env "STEVEDORE_CACHE_FROM" }}' entries, which
+# render empty (and are skipped, stevedore >= v0.0.5) outside CI so local
+# builds are unaffected.
+#
+# Remaining gap vs the matrix implementation: no Dispatch publish notification
+# yet (blairham/stevedore#6) — the EventBridge ECR-push backstop still covers
+# deploy correlation. Callers should keep `no-push: true` (the default) or stay
+# on the pre-stevedore pin for real publishes until that is wired.
 
 on:
   workflow_call:
     inputs:
-      matrix:
-        description: "JSON matrix of services to build (GitHub Actions matrix `include` shape)"
-        required: true
+      command:
+        description: "stevedore subcommand (release, build, check)."
+        required: false
         type: string
-      private-modules:
-        description: >-
-          Mint a short-lived, read-only token for the org-wide pinpredict-argocd
-          App (BOOTSTRAP_APP_ID / BOOTSTRAP_APP_PRIVATE_KEY) and expose it to the
-          build as BuildKit secret `id=gh_token`. Opt-in for services whose
-          Dockerfile fetches a private pinpredict module instead of vendoring it
-          (e.g. a Go repo that requires github.com/pinpredict/ppkit) via
-          `RUN --mount=type=secret,id=gh_token ... go mod download`. Handed to
-          buildx as a `--secret`, never a `--build-arg`, so it never lands in an
-          image layer or `docker history`. Default false — a no-op for every
-          existing caller.
+        default: "release"
+      changed-since:
+        description: "git ref to diff against for change detection (e.g. the PR base or the pushed-before SHA)."
+        required: false
+        type: string
+        default: ""
+      no-push:
+        description: "Build without pushing (validation only). Default true until the Dispatch notification gap closes."
         required: false
         type: boolean
-        default: false
+        default: true
+      parallel:
+        description: "Build up to N images concurrently."
+        required: false
+        type: number
+        default: 4
+      stevedore-version:
+        description: "stevedore release to use."
+        required: false
+        type: string
+        # v0.0.5 = plan/matrix mode (v0.0.4) + skip-empty cache entries
+        # (blairham/stevedore#8), which keeps LOCAL builds of cache-wired
+        # configs working; in CI the cache env below renders the entries
+        # non-empty either way.
+        default: "v0.0.5"
 
 env:
   AWS_REGION: us-east-1
@@ -57,180 +78,80 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build:
-    if: ${{ fromJson(inputs.matrix).include[0] != null }}
+  stevedore:
     runs-on: ubuntu-latest
     permissions:
-      id-token: write
-      contents: write
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJson(inputs.matrix) }}
+      contents: write # push refs/releases/image/* marker refs on publish
+      id-token: write # AWS OIDC (ECR) + cosign keyless signing
     steps:
       - uses: actions/checkout@v6
         with:
-          fetch-depth: 0
-          fetch-tags: true
+          fetch-depth: 0 # history for versioning and change detection (stevedore fetches marker refs itself)
 
-      # Three-shot retry on the AWS AssumeRole to survive a
-      # first-colocation race with Crossplane minting the per-service
-      # xp-<svc>-gha-push role (pinpredict/trading#616). Empty
-      # `matrix.role` for un-migrated services falls back to the central
-      # xp-trading-gha-push role in secrets.AWS_ROLE_ARN. See the action
-      # for the full incident writeup.
       - name: Configure AWS credentials
         uses: pinpredict/.github/actions/configure-aws-with-retry@main
         with:
-          role-to-assume: ${{ matrix.role || secrets.AWS_ROLE_ARN }}
+          # Single-job builds push every image under the central role. The
+          # per-service xp-<svc>-gha-push roles are a matrix-mode feature
+          # (stevedore plan + release --only) — see the workflow header.
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Log in to Amazon ECR
         id: ecr-login
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-
-      # Opt-in (private-modules: true): mint a short-lived, read-only token for
-      # the org-wide pinpredict-argocd App so the build can fetch private
-      # pinpredict modules without vendoring. contents:read across the org (the
-      # App is installed on all repos); consumed by buildx as a BuildKit
-      # `--secret` below — never a build-arg — so it never lands in an image
-      # layer or `docker history`. Skipped (and the secret omitted) for every
-      # caller that leaves private-modules at its default false.
-      - name: Mint private-module read token
-        id: private-module-token
-        if: ${{ inputs.private-modules }}
-        uses: actions/create-github-app-token@v2
-        with:
-          app-id: ${{ secrets.BOOTSTRAP_APP_ID }}
-          private-key: ${{ secrets.BOOTSTRAP_APP_PRIVATE_KEY }}
-          owner: pinpredict
-          permission-contents: read
-
-      - name: Resolve version, build, push, tag
-        id: release
+      - name: Compose args
+        id: args
         env:
-          NAME: ${{ matrix.name }}
-          ECR_REPO: ${{ matrix.ecr_repo }}
-          DOCKERFILE: ${{ matrix.dockerfile || 'Dockerfile' }}
-          TARGET: ${{ matrix.target }}
-          BUILD_ARGS: ${{ matrix.build_args }}
-          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
-          SHORT_SHA: ${{ github.sha }}
-          # Empty unless private-modules minted a token above; gates the
-          # BuildKit --secret so it's a no-op for every other caller.
-          GH_PRIVATE_TOKEN: ${{ steps.private-module-token.outputs.token }}
+          NO_PUSH: ${{ inputs.no-push }}
+          PARALLEL: ${{ inputs.parallel }}
+          CHANGED_SINCE: ${{ inputs.changed-since }}
         run: |
           set -euo pipefail
-          SHORT_SHA="${SHORT_SHA:0:7}"
+          args="--parallel ${PARALLEL}"
+          [ "${NO_PUSH}" = "true" ] && args="${args} --no-push"
+          [ -n "${CHANGED_SINCE}" ] && args="${args} --changed-since ${CHANGED_SINCE}"
+          echo "value=${args}" >> "$GITHUB_OUTPUT"
 
-          # The ECR repo is the version record: next version is a patch
-          # bump of the highest X.Y.Z tag already pushed (the -<sha>
-          # sibling tags are filtered out). A missing repo or an empty
-          # tag list both mean first release.
-          latest=$(aws ecr describe-images \
-            --repository-name "${ECR_REPO}" \
-            --filter tagStatus=TAGGED \
-            --query 'imageDetails[].imageTags[]' --output text 2>/dev/null \
-            | tr '[:space:]' '\n' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
-            | sort -V | tail -n1 || true)
+      # buildx's type=gha cache backend reads ACTIONS_CACHE_URL /
+      # ACTIONS_RUNTIME_TOKEN, which GitHub only hands to actions — this step
+      # re-exports them to the job env so stevedore's shelled-out buildx sees
+      # them.
+      - name: Expose GitHub runtime for buildx gha cache
+        uses: crazy-max/ghaction-github-runtime@v3
 
-          if [ -z "$latest" ]; then
-            major=0; minor=0; patch=0
-          else
-            IFS='.' read -r major minor patch <<< "$latest"
-          fi
-          patch=$((patch + 1))
-
-          # ECR tags are immutable — probe-and-bump past any candidate
-          # that already exists (covers races that slip the workflow
-          # concurrency group and repos with gaps above the max semver).
-          while aws ecr describe-images \
-              --repository-name "${ECR_REPO}" \
-              --image-ids imageTag="${major}.${minor}.${patch}" >/dev/null 2>&1; do
-            echo "Image ${ECR_REPO}:${major}.${minor}.${patch} exists in ECR — bumping"
-            patch=$((patch + 1))
-          done
-          version="${major}.${minor}.${patch}"
-
-          echo "Building ${ECR_REPO} v${version} from ${DOCKERFILE}${TARGET:+ (target=${TARGET})}"
-
-          buildx_args=(
-            --platform linux/amd64
-            --push
-            --provenance=false
-            --cache-from "type=gha,scope=${NAME}"
-            --cache-to "type=gha,mode=max,scope=${NAME}"
-            -t "${ECR_REGISTRY}/${ECR_REPO}:${version}"
-            -t "${ECR_REGISTRY}/${ECR_REPO}:${version}-${SHORT_SHA}"
-            -f "${DOCKERFILE}"
-            # Stamp the resolved version into the build so images can
-            # surface what they actually are at runtime (e.g. Vite-baked
-            # `VITE_APP_VERSION` for SPA bundles, /api/version fallback
-            # for backend services). Dockerfiles that don't declare
-            # `ARG APP_VERSION` silently ignore it.
-            --build-arg "APP_VERSION=${version}"
-            # Stamp the git short-SHA too. Unlike the per-repo `0.0.X`
-            # version (a build-ID), the commit is identical iff the code is
-            # identical — the reliable "is this the same build?" signal for
-            # services on parallel lanes (e.g. trader-tools stable vs dev).
-            # Dockerfiles that don't declare `ARG GIT_SHA` silently ignore it.
-            --build-arg "GIT_SHA=${SHORT_SHA}"
-          )
-          if [ -n "${TARGET}" ]; then
-            buildx_args+=(--target "${TARGET}")
-          fi
-          if [ -n "${BUILD_ARGS}" ]; then
-            while IFS= read -r ba; do
-              [ -z "$ba" ] && continue
-              buildx_args+=(--build-arg "$ba")
-            done <<< "${BUILD_ARGS}"
-          fi
-
-          # Private-module fetch (inputs.private-modules): hand the minted App
-          # token to the build as a BuildKit secret, readable inside the
-          # Dockerfile at /run/secrets/gh_token via
-          # `RUN --mount=type=secret,id=gh_token`. Only added when the token
-          # step ran (env non-empty) — a no-op for every other caller.
-          if [ -n "${GH_PRIVATE_TOKEN:-}" ]; then
-            buildx_args+=(--secret "id=gh_token,env=GH_PRIVATE_TOKEN")
-          fi
-
-          docker buildx build "${buildx_args[@]}" .
-
-          # Advance the per-service release marker — one mutable ref,
-          # not a tag, so it is invisible to Kargo's tag enumeration and
-          # the GitHub create-webhook. discover-services diffs against
-          # it to decide whether the service needs a rebuild.
-          git push --force origin "${GITHUB_SHA}:refs/releases/image/${NAME}" \
-            || echo "::warning::Marker ref push failed for refs/releases/image/${NAME} — next run falls back to the legacy tag baseline"
-
-          echo "version=${version}" >> "$GITHUB_OUTPUT"
-
-      # The publish signal (platform-gitops#1201). Never fails the
-      # release; the EventBridge ECR-push backstop covers a missed
-      # notification.
-      - name: Notify Dispatch
-        if: steps.release.outcome == 'success'
-        uses: pinpredict/.github/actions/notify-dispatch@main
+      - name: Stevedore
+        # uses: refs cannot be expressions — pin the action; the `version`
+        # input below selects the binary that actually runs.
+        uses: blairham/stevedore@v0.0.5
+        env:
+          # ECR host, e.g. 123456789.dkr.ecr.us-east-1.amazonaws.com — the
+          # .stevedore.yaml repositories template this as {{ .Env.REGISTRY }}.
+          REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          # One layer-cache scope per calling repo (GHA cache is already
+          # repo-scoped). Configs opt in per image via
+          # '{{ index .Env "STEVEDORE_CACHE_FROM" }}' — repos without cache
+          # entries simply ignore these.
+          STEVEDORE_CACHE_FROM: "type=gha,scope=stevedore"
+          STEVEDORE_CACHE_TO: "type=gha,mode=max,scope=stevedore"
         with:
-          kind: image
-          service: ${{ matrix.name }}
-          version: ${{ steps.release.outputs.version }}
-          secret: ${{ secrets.CI_WEBHOOK_SECRET }}
+          command: ${{ inputs.command }}
+          version: ${{ inputs.stevedore-version }}
+          args: ${{ steps.args.outputs.value }}
+          # cosign/syft/grype install is skipped — enable per config once
+          # sign/sbom/scan are turned on in .stevedore.yaml.
+          install-cosign: "false"
+          install-syft: "false"
+          install-grype: "false"
 
-  # Kept as the aggregate fail-gate (stable check name for branch
-  # protection). The GitHub release it used to create was keyed off the
-  # legacy image/* git tag; Dispatch's Slack cards carry the per-service
-  # changelog now (platform-gitops#1201).
-  release-summary:
-    needs: build
-    if: ${{ !cancelled() && needs.build.result != 'skipped' }}
-    runs-on: ubuntu-latest
-    steps:
-      - name: Fail if any build failed
-        if: needs.build.result != 'success'
-        run: |
-          echo "::error::One or more service builds failed (build job result: ${{ needs.build.result }})"
-          exit 1
+# ── How a repo calls it ──────────────────────────────────────────────────────
+#
+# jobs:
+#   images:
+#     permissions: { contents: write, id-token: write }
+#     uses: pinpredict/.github/.github/workflows/docker-release.yml@main
+#     with:
+#       changed-since: ${{ github.event.before }}   # or the PR base SHA
+#       no-push: true                                # flip to false to publish
+#     secrets: inherit

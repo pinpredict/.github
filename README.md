@@ -10,7 +10,7 @@ Why `.github` and not a dedicated `github-actions` repo: `.github` is *the* GitH
 
 | File | Purpose |
 |---|---|
-| `docker-release.yml` | Matrix-based image build + push to ECR. Version = highest `X.Y.Z` tag in the ECR repo + 1 (ECR is the version record — platform-gitops#1201); advances the `refs/releases/image/<name>` marker ref and notifies Dispatch. No git tags or GitHub Releases. Caller passes a `matrix` input in the standard `{include:[...]}` shape. Optional `private-modules: true` mints a short-lived read-only `pinpredict-argocd` App token and exposes it to the build as BuildKit secret `id=gh_token` (`RUN --mount=type=secret,id=gh_token …`) — for Dockerfiles that fetch a private pinpredict module (e.g. `github.com/pinpredict/ppkit`) instead of vendoring it. Default false. |
+| `docker-release.yml` | Image build + release via [stevedore](https://github.com/blairham/stevedore), driven by the caller repo's `.stevedore.yaml` — **no `matrix` input**. Single job by design (pinpredict/.github#39): one runner + one BuildKit, so a build-once Dockerfile compiles once for every image. Version = highest `X.Y.Z` tag in the ECR repo + 1 (ECR is the version record — platform-gitops#1201, resolved by stevedore); advances the `refs/releases/image/<id>` marker refs. No git tags or GitHub Releases. Exports `STEVEDORE_CACHE_FROM/TO` (one `type=gha` scope) for configs that opt into layer caching. `no-push` defaults `true` until the Dispatch notification gap (blairham/stevedore#6) closes. Existing callers are pinned to `@pre-stevedore` (the frozen matrix implementation, which also carried the `private-modules` BuildKit-secret input) — see the tagging exception below. |
 | `chart-release.yml` | Auto-discovers `charts/*/`, skips charts unchanged since their `refs/releases/chart/<name>` marker ref, resolves the next version from the ECR OCI repo, packages, pushes (+ `X.Y.Z-<sha7>` provenance alias), advances the marker, notifies Dispatch. No git tags or GitHub Releases. No caller inputs. |
 | `tag-config.yml` | Tags merges to main that touch `.platform/services/<svc>.yaml` with `vX.Y.Z+<svc>` (per-service Kargo `<svc>-config` Warehouse freight), then dispatches `service-config-tag` to platform-gitops so missing pointer files get seeded. |
 | `actionlint.yml` | Lints GitHub Actions workflow YAML with [`actionlint`](https://github.com/rhysd/actionlint) at a pinned version. Self-runs on this repo when PRs/pushes touch `.github/workflows/**` or `actions/**/action.yml`; callers reuse it via `uses: pinpredict/.github/.github/workflows/actionlint.yml@main`. |
@@ -70,7 +70,7 @@ Why `.github` and not a dedicated `github-actions` repo: `.github` is *the* GitH
 
 Pin callers to `@main`. We own all consumers, so version pinning adds overhead without safety benefit at this team size — `@main` gives the "edit once, propagate everywhere" property that's the whole point of centralizing. If blast radius ever bites, we add a tag selectively for the workflows that broke; we don't pre-tag everything.
 
-**Current exception — the `pre-stevedore` tag.** `docker-release.yml` is being rebuilt on [stevedore](https://github.com/blairham/stevedore), which is exactly the "blast radius bites" case the rule reserves. Callers of `docker-release.yml` (and only that workflow) are temporarily pinned to `@pre-stevedore`, a frozen snapshot of main — not a maintained version line, no fixes land on it. Everything else (chart-release, composites, tag-config) stays on `@main`. The pin comes off caller-by-caller as each repo migrates, and the tag is deleted when the migration completes.
+**Current exception — the `pre-stevedore` tag.** `docker-release.yml` on main is now the [stevedore](https://github.com/blairham/stevedore) implementation — the rebuild that is exactly the "blast radius bites" case the rule reserves. Callers of `docker-release.yml` (and only that workflow) are temporarily pinned to `@pre-stevedore`, the frozen snapshot of the old matrix implementation — not a maintained version line, no fixes land on it. Everything else (chart-release, composites, tag-config) stays on `@main`. A repo migrates by adding a `.stevedore.yaml`, dropping the `matrix` input from its `ci.yml`, and pointing `uses:` back to `@main`; the tag is deleted when the migration completes.
 
 For workflows that touch secrets/OIDC, pin to an immutable SHA only if a security audit later requires it.
 
@@ -132,13 +132,16 @@ jobs:
         with:
           github-token: ${{ steps.pg-read-token.outputs.token }}
 
+  # Stevedore reads .stevedore.yaml and does its own change detection —
+  # no matrix input. Migrating repos: swap @pre-stevedore back to @main
+  # and drop the matrix wiring.
   docker-release:
     needs: [detect, test]
-    if: needs.detect.outputs.docker_matrix != '{"include":[]}'
     permissions: { id-token: write, contents: write }
     uses: pinpredict/.github/.github/workflows/docker-release.yml@main
     with:
-      matrix: ${{ needs.detect.outputs.docker_matrix }}
+      changed-since: ${{ github.event.before }}
+      no-push: true # flip to false once the Dispatch notification lands
     secrets: inherit
 
   chart-release:
