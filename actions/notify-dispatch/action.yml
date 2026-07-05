@@ -8,14 +8,25 @@ description: >-
 
 inputs:
   kind:
-    description: '"image" or "chart"'
-    required: true
+    description: '"image" or "chart" (single mode; ignored when batch is set)'
+    required: false
+    default: ""
   service:
-    description: Service / chart name (the tag's middle segment)
-    required: true
+    description: Service / chart name (single mode; ignored when batch is set)
+    required: false
+    default: ""
   version:
-    description: Released version (X.Y.Z)
-    required: true
+    description: Released version X.Y.Z (single mode; ignored when batch is set)
+    required: false
+    default: ""
+  batch:
+    description: >-
+      JSON array of {kind, service, version} objects to notify in one call —
+      for releases that publish several artifacts at once (e.g. the stevedore
+      docker-release summary). When set, the kind/service/version inputs are
+      ignored. Empty array is a no-op.
+    required: false
+    default: ""
   secret:
     description: >-
       HMAC secret (org Actions secret CI_WEBHOOK_SECRET, reaches reusable
@@ -37,6 +48,7 @@ runs:
         KIND: ${{ inputs.kind }}
         SERVICE: ${{ inputs.service }}
         VERSION: ${{ inputs.version }}
+        BATCH: ${{ inputs.batch }}
         SECRET: ${{ inputs.secret }}
         URL: ${{ inputs.url }}
         RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -47,17 +59,33 @@ runs:
           exit 0
         fi
 
-        body=$(printf '{"repo":"%s","kind":"%s","service":"%s","version":"%s","sha":"%s","run_url":"%s"}' \
-          "${GITHUB_REPOSITORY}" "${KIND}" "${SERVICE}" "${VERSION}" "${GITHUB_SHA}" "${RUN_URL}")
-        sig=$(printf '%s' "$body" | openssl dgst -sha256 -hmac "${SECRET}" | awk '{print $NF}')
+        notify() {
+          local kind=$1 service=$2 version=$3
+          local body sig status
+          body=$(printf '{"repo":"%s","kind":"%s","service":"%s","version":"%s","sha":"%s","run_url":"%s"}' \
+            "${GITHUB_REPOSITORY}" "${kind}" "${service}" "${version}" "${GITHUB_SHA}" "${RUN_URL}")
+          sig=$(printf '%s' "$body" | openssl dgst -sha256 -hmac "${SECRET}" | awk '{print $NF}')
 
-        status=$(curl -sS -o /tmp/dispatch-resp.json -w '%{http_code}' -X POST "${URL}" \
-          -H "Content-Type: application/json" \
-          -H "X-Dispatch-Signature: ${sig}" \
-          --data "$body" || echo "000")
+          status=$(curl -sS -o /tmp/dispatch-resp.json -w '%{http_code}' -X POST "${URL}" \
+            -H "Content-Type: application/json" \
+            -H "X-Dispatch-Signature: ${sig}" \
+            --data "$body" || echo "000")
 
-        if [ "$status" -ge 200 ] && [ "$status" -lt 300 ]; then
-          echo "Dispatch notified: ${KIND} ${SERVICE} ${VERSION}"
+          if [ "$status" -ge 200 ] && [ "$status" -lt 300 ]; then
+            echo "Dispatch notified: ${kind} ${service} ${version}"
+          else
+            echo "::warning::Dispatch notification returned ${status}: $(cat /tmp/dispatch-resp.json 2>/dev/null || true) — ECR-push backstop covers this release"
+          fi
+        }
+
+        if [ -n "${BATCH}" ]; then
+          count=$(jq -r 'length' <<<"${BATCH}")
+          echo "Notifying Dispatch for ${count} artifact(s)"
+          jq -c '.[]' <<<"${BATCH}" | while IFS= read -r entry; do
+            notify "$(jq -r .kind <<<"$entry")" "$(jq -r .service <<<"$entry")" "$(jq -r .version <<<"$entry")"
+          done
+        elif [ -n "${SERVICE}" ]; then
+          notify "${KIND}" "${SERVICE}" "${VERSION}"
         else
-          echo "::warning::Dispatch notification returned ${status}: $(cat /tmp/dispatch-resp.json 2>/dev/null || true) — ECR-push backstop covers this release"
+          echo "Nothing to notify (no batch, no service)"
         fi
