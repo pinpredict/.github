@@ -59,6 +59,23 @@ on:
         required: false
         type: string
         default: ""
+      private-modules:
+        description: >-
+          Mint a short-lived, read-only pinpredict-argocd App token
+          (BOOTSTRAP_APP_ID / BOOTSTRAP_APP_PRIVATE_KEY) and expose it to the
+          build as the env var GH_PRIVATE_TOKEN. Opt-in for repos whose
+          Dockerfile fetches a private pinpredict module instead of vendoring it
+          (a Go repo that requires github.com/pinpredict/ppkit) via
+          `RUN --mount=type=secret,id=gh_token ... go mod download`. The repo's
+          .stevedore.yaml wires the token to a BuildKit --secret with
+          `secrets: [{id: gh_token, env: GH_PRIVATE_TOKEN}]`; stevedore hands it
+          to buildx as a --secret, never a --build-arg, so it never lands in an
+          image layer or `docker history`. Default false — a no-op for every
+          existing caller: stevedore skips an env-backed secret whose variable
+          is unset, so even a config that declares the secret stays inert here.
+        required: false
+        type: boolean
+        default: false
       parallel:
         description: "Build up to N images concurrently."
         required: false
@@ -68,10 +85,13 @@ on:
         description: "stevedore release to use."
         required: false
         type: string
-        # v0.0.6 = skip-empty cache entries (v0.0.5, blairham/stevedore#8)
-        # + release summary with pushed/reason fields as a step output
-        # (blairham/stevedore#9) — the Notify Dispatch step consumes it.
-        default: "v0.0.6"
+        # v0.0.7 = skip an env-backed build secret whose variable is unset
+        # (blairham/stevedore#10) — required for the private-modules gh_token
+        # secret to stay inert on callers that leave it off, and for local
+        # private-module builds. Also carries: release summary with
+        # pushed/reason fields as a step output (blairham/stevedore#9, consumed
+        # by Notify Dispatch) and skip-empty cache entries (#8).
+        default: "v0.0.7"
 
 env:
   AWS_REGION: us-east-1
@@ -130,11 +150,29 @@ jobs:
       - name: Expose GitHub runtime for buildx gha cache
         uses: crazy-max/ghaction-github-runtime@v3
 
+      # Opt-in (private-modules: true): mint a short-lived, read-only token for
+      # the org-wide pinpredict-argocd App so the build can fetch private
+      # pinpredict modules without vendoring. contents:read across the org (the
+      # App is installed on all repos); exposed as the GH_PRIVATE_TOKEN env
+      # below, which the repo's .stevedore.yaml wires to a BuildKit --secret —
+      # never a build-arg — so it never lands in an image layer or
+      # `docker history`. Skipped (and the env left empty, so stevedore omits
+      # the secret) for every caller that leaves private-modules at its default.
+      - name: Mint private-module read token
+        id: private-module-token
+        if: ${{ inputs.private-modules }}
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.BOOTSTRAP_APP_ID }}
+          private-key: ${{ secrets.BOOTSTRAP_APP_PRIVATE_KEY }}
+          owner: pinpredict
+          permission-contents: read
+
       - name: Stevedore
         id: stevedore
         # uses: refs cannot be expressions — pin the action; the `version`
         # input below selects the binary that actually runs.
-        uses: blairham/stevedore@v0.0.6
+        uses: blairham/stevedore@v0.0.7
         env:
           # ECR host, e.g. 123456789.dkr.ecr.us-east-1.amazonaws.com — the
           # .stevedore.yaml repositories template this as {{ .Env.REGISTRY }}.
@@ -145,6 +183,14 @@ jobs:
           # entries simply ignore these.
           STEVEDORE_CACHE_FROM: "type=gha,scope=stevedore"
           STEVEDORE_CACHE_TO: "type=gha,mode=max,scope=stevedore"
+          # Empty unless private-modules minted a token above. The repo's
+          # .stevedore.yaml declares `secrets: [{id: gh_token, env:
+          # GH_PRIVATE_TOKEN}]`; when private-modules is true this is populated,
+          # so stevedore emits the --secret. A caller leaving private-modules at
+          # its default false passes no token — stevedore skips an env-backed
+          # secret whose variable is unset (v0.0.7+, the pinned default above),
+          # so the declared secret stays inert.
+          GH_PRIVATE_TOKEN: ${{ steps.private-module-token.outputs.token }}
         with:
           command: ${{ inputs.command }}
           version: ${{ inputs.stevedore-version }}
