@@ -261,7 +261,11 @@ runs:
           # the image. We invert it: `!` lines are the allow-list; anything
           # matching becomes a candidate for "docker-relevant change".
           if [ -f .dockerignore ]; then
-            includes=$(grep '^!' .dockerignore | sed 's|^!||; s|[.]|\\.|g; s|/$|/.*|; s|\*|.*|g')
+            # `|| true`: a .dockerignore with no `!` allow-list lines makes
+            # grep exit 1, and `set -e` (with pipefail) would abort the whole
+            # detect job on that empty-match — same failure class as the
+            # SIGPIPE guard below. An empty `includes` is handled downstream.
+            includes=$(grep '^!' .dockerignore | sed 's|^!||; s|[.]|\\.|g; s|/$|/.*|; s|\*|.*|g' || true)
           else
             includes=""
           fi
