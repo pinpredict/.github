@@ -55,7 +55,7 @@ on:
         type: boolean
         default: false
       only:
-        description: "Comma-separated image ids to release (stevedore --only); empty releases per change detection. Feeds workflow_dispatch service pickers."
+        description: "Comma-separated image ids to release (stevedore --only), 'all' to force every image, or empty for change detection. Feeds workflow_dispatch service pickers."
         required: false
         type: string
         default: ""
@@ -137,10 +137,19 @@ jobs:
           ONLY: ${{ inputs.only }}
         run: |
           set -euo pipefail
+          only="${ONLY//[[:space:]]/}"
+          if [ "$only" = "all" ]; then
+            only=$(yq -r '[.images[].id] | join(",")' .stevedore.yaml)
+            [ -n "$only" ] || { echo "::error::No image ids found in .stevedore.yaml"; exit 1; }
+          elif [ -n "$ONLY" ] && [ -z "$only" ]; then
+            echo "::error::only must be 'all' or a comma-separated image list"
+            exit 1
+          fi
+
           args="--parallel ${PARALLEL}"
           [ "${NO_PUSH}" = "true" ] && args="${args} --no-push"
           [ -n "${CHANGED_SINCE}" ] && args="${args} --changed-since ${CHANGED_SINCE}"
-          [ -n "${ONLY}" ] && args="${args} --only ${ONLY}"
+          [ -n "$only" ] && args="${args} --only ${only}"
           echo "value=${args}" >> "$GITHUB_OUTPUT"
 
       # buildx's type=gha cache backend reads ACTIONS_CACHE_URL /

@@ -10,8 +10,8 @@ Why `.github` and not a dedicated `github-actions` repo: `.github` is *the* GitH
 
 | File | Purpose |
 |---|---|
-| `docker-release.yml` | Image build + release via [stevedore](https://github.com/blairham/stevedore), driven by the caller repo's `.stevedore.yaml` — **no `matrix` input**. Single job by design (pinpredict/.github#39): one runner + one BuildKit, so a build-once Dockerfile compiles once for every image. Version = highest `X.Y.Z` tag in the ECR repo + 1 (ECR is the version record — platform-gitops#1201, resolved by stevedore); advances the `refs/releases/image/<id>` marker refs. No git tags or GitHub Releases. Exports `STEVEDORE_CACHE_FROM/TO` (one `type=gha` scope) for configs that opt into layer caching. Notifies Dispatch once per **pushed** image from stevedore's release summary (`no-push` builds notify nothing). Optional `private-modules: true` mints a short-lived read-only `pinpredict-argocd` App token and exposes it as `GH_PRIVATE_TOKEN`, which the caller's `.stevedore.yaml` wires to a BuildKit `--secret` (`secrets: [{id: gh_token, env: GH_PRIVATE_TOKEN}]`) so a Dockerfile can `go mod download` a private pinpredict module (e.g. `github.com/pinpredict/ppkit`) without vendoring — the Docker analogue of `setup-go`'s `private-modules`; default false. Existing callers are pinned to `@pre-stevedore` (the frozen matrix implementation, which carried the same `private-modules` BuildKit-secret input) — see the tagging exception below. |
-| `chart-release.yml` | Auto-discovers `charts/*/`, skips charts unchanged since their `refs/releases/chart/<name>` marker ref, resolves the next version from the ECR OCI repo, packages, pushes (+ `X.Y.Z-<sha7>` provenance alias), advances the marker, notifies Dispatch. No git tags or GitHub Releases. No caller inputs. |
+| `docker-release.yml` | Image build + release via [stevedore](https://github.com/blairham/stevedore), driven by the caller repo's `.stevedore.yaml` — **no `matrix` input**. Single job by design (pinpredict/.github#39): one runner + one BuildKit, so a build-once Dockerfile compiles once for every image. Version = highest `X.Y.Z` tag in the ECR repo + 1 (ECR is the version record — platform-gitops#1201, resolved by stevedore); advances the `refs/releases/image/<id>` marker refs. No git tags or GitHub Releases. Optional `only` accepts comma-separated image ids or `all` for manual release pickers. Exports `STEVEDORE_CACHE_FROM/TO` (one `type=gha` scope) for configs that opt into layer caching. Notifies Dispatch once per **pushed** image from stevedore's release summary (`no-push` builds notify nothing). Optional `private-modules: true` mints a short-lived read-only `pinpredict-argocd` App token and exposes it as `GH_PRIVATE_TOKEN`, which the caller's `.stevedore.yaml` wires to a BuildKit `--secret` (`secrets: [{id: gh_token, env: GH_PRIVATE_TOKEN}]`) so a Dockerfile can `go mod download` a private pinpredict module (e.g. `github.com/pinpredict/ppkit`) without vendoring — the Docker analogue of `setup-go`'s `private-modules`; default false. Existing callers are pinned to `@pre-stevedore` (the frozen matrix implementation, which carried the same `private-modules` BuildKit-secret input) — see the tagging exception below. |
+| `chart-release.yml` | Auto-discovers `charts/*/`, skips charts unchanged since their `refs/releases/chart/<name>` marker ref, resolves the next version from the ECR OCI repo, packages, pushes (+ `X.Y.Z-<sha7>` provenance alias), advances the marker, notifies Dispatch. No git tags or GitHub Releases. Optional `only` accepts comma-separated chart names for a targeted manual release. |
 | `tag-config.yml` | Tags merges to main that touch `.platform/services/<svc>.yaml` with `vX.Y.Z+<svc>` (per-service Kargo `<svc>-config` Warehouse freight), then dispatches `service-config-tag` to platform-gitops so missing pointer files get seeded. |
 | `actionlint.yml` | Lints GitHub Actions workflow YAML with [`actionlint`](https://github.com/rhysd/actionlint) at a pinned version. Self-runs on this repo when PRs/pushes touch `.github/workflows/**` or `actions/**/action.yml`; callers reuse it via `uses: pinpredict/.github/.github/workflows/actionlint.yml@main`. |
 
@@ -141,6 +141,7 @@ jobs:
     uses: pinpredict/.github/.github/workflows/docker-release.yml@main
     with:
       changed-since: ${{ github.event.before }}
+      only: ${{ github.event_name == 'workflow_dispatch' && inputs.services || '' }}
     secrets: inherit
 
   chart-release:
@@ -148,6 +149,9 @@ jobs:
     if: needs.detect.outputs.charts_changed == 'true'
     permissions: { id-token: write, contents: write }
     uses: pinpredict/.github/.github/workflows/chart-release.yml@main
+    with:
+      # Keep this expression identical to docker-release's `only` value.
+      only: ${{ github.event_name == 'workflow_dispatch' && inputs.services || '' }}
     secrets: inherit
 ```
 

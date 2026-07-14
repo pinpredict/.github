@@ -13,12 +13,25 @@ name: Helm Chart Release
 #     No git tags or GitHub Releases are minted — historical
 #     `chart/<name>/X.Y.Z` tags remain as the frozen fallback baseline.
 #
-# Caller has no inputs; auto-discovery handles everything. Each repo's
-# `ci.yml` decides whether to call this workflow.
+# Auto-discovery remains the default. Callers with a manual service picker can
+# pass `only` to force exactly those chart names; this must stay aligned with
+# docker-release's `only` input so a targeted release cannot fan out on charts.
 
 on:
   workflow_call:
+    inputs:
+      only:
+        description: "Comma-separated chart names to release; empty uses change detection."
+        required: false
+        type: string
+        default: ""
   workflow_dispatch:
+    inputs:
+      only:
+        description: "Charts to release: 'all' or comma-separated names."
+        required: false
+        type: string
+        default: "all"
 
 env:
   AWS_REGION: us-east-1
@@ -43,9 +56,35 @@ jobs:
 
       - name: Discover charts needing release
         id: set
+        env:
+          FORCE: ${{ github.event_name == 'workflow_dispatch' }}
+          ONLY: ${{ inputs.only }}
         run: |
           set -euo pipefail
-          force=${{ github.event_name == 'workflow_dispatch' }}
+          force="${FORCE:-false}"
+          scope="${ONLY//[[:space:]]/}"
+          if [ "$scope" = "all" ]; then
+            force=true
+            scope=""
+          elif [ -n "$ONLY" ] && [ -z "$scope" ]; then
+            echo "::error::only must be 'all' or a comma-separated chart list"
+            exit 1
+          fi
+
+          requested_names=()
+          discovered_names=()
+          if [ -n "$scope" ]; then
+            force=true
+            IFS=',' read -ra candidates <<< "$scope"
+            for requested_name in "${candidates[@]}"; do
+              if [[ ! "$requested_name" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
+                echo "::error::Invalid chart name '${requested_name}' in only='${ONLY}'"
+                exit 1
+              fi
+              requested_names+=("$requested_name")
+            done
+          fi
+
           entries=()
 
           # Per-service IAM push role. All trading services are
@@ -77,6 +116,15 @@ jobs:
             [ -f "${chart_dir}Chart.yaml" ] || continue
             name=$(grep '^name:' "${chart_dir}Chart.yaml" | awk '{print $2}')
 
+            if [ -n "$scope" ]; then
+              selected=false
+              for requested_name in "${requested_names[@]}"; do
+                [ "$requested_name" = "$name" ] && selected=true
+              done
+              [ "$selected" = "true" ] || continue
+            fi
+            discovered_names+=("$name")
+
             base=""
             if git rev-parse -q --verify "refs/releases/chart/${name}" >/dev/null; then
               base="refs/releases/chart/${name}"
@@ -101,6 +149,21 @@ jobs:
             role=$(per_service_role "$name")
             entries+=("{\"name\":\"${name}\",\"dir\":\"${dir}\",\"role\":\"${role}\"}")
           done
+
+          if [ -n "$scope" ]; then
+            missing=()
+            for requested_name in "${requested_names[@]}"; do
+              found=false
+              for discovered_name in "${discovered_names[@]-}"; do
+                [ "$requested_name" = "$discovered_name" ] && found=true
+              done
+              [ "$found" = "true" ] || missing+=("$requested_name")
+            done
+            if [ ${#missing[@]} -gt 0 ]; then
+              echo "::error::Requested chart(s) not found: $(IFS=,; echo "${missing[*]}")"
+              exit 1
+            fi
+          fi
 
           if [ ${#entries[@]} -eq 0 ]; then
             echo "matrix={\"include\":[]}" >> "$GITHUB_OUTPUT"
