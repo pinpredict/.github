@@ -60,7 +60,7 @@ runs:
     - name: Mint private-module read token
       id: private-module-token
       if: ${{ inputs.private-modules == 'true' }}
-      uses: actions/create-github-app-token@v2
+      uses: actions/create-github-app-token@v3
       with:
         app-id: ${{ inputs.private-modules-app-id }}
         private-key: ${{ inputs.private-modules-app-private-key }}
