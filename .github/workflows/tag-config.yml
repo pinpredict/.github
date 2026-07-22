@@ -141,7 +141,7 @@ jobs:
       - name: Mint GitHub App token
         if: steps.changed.outputs.list != ''
         id: app-token
-        uses: actions/create-github-app-token@v2
+        uses: actions/create-github-app-token@v3
         with:
           app-id: ${{ secrets.BOOTSTRAP_APP_ID }}
           private-key: ${{ secrets.BOOTSTRAP_APP_PRIVATE_KEY }}

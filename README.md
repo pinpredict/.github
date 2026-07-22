@@ -119,7 +119,7 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
     steps:
-      - uses: actions/create-github-app-token@v2
+      - uses: actions/create-github-app-token@v3
         id: pg-read-token
         with:
           app-id: ${{ secrets.BOOTSTRAP_APP_ID }}

@@ -170,7 +170,7 @@ jobs:
       - name: Mint private-module read token
         id: private-module-token
         if: ${{ inputs.private-modules }}
-        uses: actions/create-github-app-token@v2
+        uses: actions/create-github-app-token@v3
         with:
           app-id: ${{ secrets.BOOTSTRAP_APP_ID }}
           private-key: ${{ secrets.BOOTSTRAP_APP_PRIVATE_KEY }}
