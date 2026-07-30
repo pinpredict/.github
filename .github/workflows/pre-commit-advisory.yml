@@ -164,6 +164,30 @@ jobs:
               ;;
           esac
 
+      # Go caches for the `language: golang` hooks (go-mod-tidy-repo,
+      # golangci-lint). pre-commit diff-scopes the *trigger* (the hooks are
+      # skipped when no .go file changed), but the hooks themselves are
+      # pass_filenames:false — golangci-lint typechecks the whole module and
+      # go mod tidy re-resolves the full module graph. Cold, that costs
+      # ~4 minutes per run (measured on chaos-lab: 42s tidy + 3m27s lint);
+      # warm, the same hooks re-analyze only what changed. ~/go/pkg/mod also
+      # holds the GOTOOLCHAIN auto-provisioned toolchain from the pin step
+      # above. Restore-only here: PR runs never save (a per-sha, ~0.5-1GB
+      # cache per push would churn the repo's 10GB cache budget); the
+      # push-to-default-branch seed run saves below, so PRs restore a cache
+      # at most one merge behind.
+      - name: Restore Go hook caches
+        if: hashFiles('**/go.sum') != ''
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+            ~/.cache/golangci-lint
+          key: go-hook-caches-${{ runner.os }}-${{ github.sha }}
+          restore-keys: |
+            go-hook-caches-${{ runner.os }}-
+
       # Optional: install .NET SDK + restore local tools (csharpier, etc).
       # setup-dotnet@v5 caches the SDK by version across runs.
       - name: Set up .NET
@@ -217,6 +241,29 @@ jobs:
       - name: Install pre-commit hook envs (cache seed)
         if: github.event_name == 'push'
         run: pre-commit install-hooks
+
+      # install-hooks builds hook envs but never *executes* the Go hooks, so
+      # the default-branch scope would otherwise never hold a warm Go
+      # module/build/lint cache and every PR would pay the cold whole-module
+      # lint. Execute the Go hooks here to populate those caches. `|| true`
+      # on each: this is a cache seed, not a gate — whole-repo runs replay
+      # org-wide debt on purpose here, and repos without one of these hook
+      # ids just skip it.
+      - name: Warm Go hook caches (cache seed)
+        if: github.event_name == 'push' && hashFiles('**/go.sum') != ''
+        run: |
+          pre-commit run go-mod-tidy-repo --all-files || true
+          pre-commit run golangci-lint --all-files || true
+
+      - name: Save Go hook caches (cache seed)
+        if: github.event_name == 'push' && hashFiles('**/go.sum') != ''
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+            ~/.cache/golangci-lint
+          key: go-hook-caches-${{ runner.os }}-${{ github.sha }}
 
       - name: Run pre-commit on PR diff
         if: github.event_name == 'pull_request'
