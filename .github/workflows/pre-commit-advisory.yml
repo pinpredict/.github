@@ -79,6 +79,19 @@ jobs:
     # run, the default-branch scope is never populated, so every new
     # PR branch rebuilds hook envs from scratch on its first run.
     if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
+    # The push run seeds caches and gates nothing — its hook steps already
+    # end in `|| true` and the "reflect exit code" step below is
+    # pull_request-only, so it can never legitimately go red. It could still
+    # fail on an *infrastructure* step, and did: a transient
+    # `curl: (35) Recv failure: Connection reset by peer` while downloading
+    # the go-pre-commit release archive turned an otherwise-green k5s main
+    # into a red ❌ (k5s run 30964880559; a plain re-run went green with no
+    # change). A seed run failing costs PRs a cold cache, not correctness —
+    # that is not worth painting a service repo's default branch red.
+    #
+    # PR runs are unaffected: they keep failing loudly so engineers still see
+    # the ❌ that makes the advisory comment worth reading.
+    continue-on-error: ${{ github.event_name == 'push' }}
     steps:
       - uses: actions/checkout@v6
         with:
