@@ -51,6 +51,8 @@ After tagging `vX.Y.Z+<svc>`, `tag-config.yml` mints a GitHub App token (`BOOTST
 
 It posts a sticky PR comment with hook output and fails the job (so engineers see a ❌), but is **not** in any repo's required-checks list. Scoped to PR diff (`--from-ref`/`--to-ref`) so engineers only see violations they introduced. If you ever wire a setup step (e.g. another language toolchain) into the advisory workflow, gate it behind an input that defaults to `false` — matches the existing `setup-dotnet` / `setup-node-pnpm` pattern.
 
+The **push-to-default-branch run is `continue-on-error`** — it only seeds caches (its hook steps end in `|| true`, and the exit-code-reflecting step is `pull_request`-only), so it gates nothing and must never redden a service repo's default branch. It previously could, via an infrastructure step rather than a hook: a transient `curl: (35) Recv failure` fetching the go-pre-commit release archive failed an otherwise-green k5s main. A failed seed costs PRs a cold cache, nothing more. Keep PR runs failing loudly — that ❌ is what makes the advisory comment worth reading.
+
 ## Editing playbook
 
 - **Changing the docker matrix shape** in `discover-services/action.yml`: its docker-release consumer now lives only on the frozen `@pre-stevedore` tag (never retarget it) — pinned callers' `ci.yml` files still read the matrix output, so treat the shape as frozen until the stevedore migration completes.
