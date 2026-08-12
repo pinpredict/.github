@@ -129,18 +129,39 @@ jobs:
       # Python is still needed for `language: python` hooks (ruff, …) —
       # go-pre-commit builds their venvs with the interpreter on PATH.
       - uses: actions/setup-python@v6
+        id: setup-python
         with:
           python-version: ${{ inputs.python-version }}
 
       # Key prefix is go-pre-commit-* so envs built by the old Python
       # pre-commit are never restored into the Go implementation.
+      #
+      # Keyed on the *resolved* interpreter (steps.setup-python.outputs
+      # .python-version — a full X.Y.Z) rather than the `python-version`
+      # input, which callers give as a bare X.Y. The venvs go-pre-commit
+      # builds under ~/.cache/pre-commit/repo*/py_env-* hardlink the
+      # interpreter by full patch path (/opt/hostedtoolcache/Python/X.Y.Z),
+      # so when a runner-image refresh bumps the patch, a key pinned to
+      # X.Y still matches exactly and restores venvs whose interpreter no
+      # longer exists — every `language: python` hook then dies with
+      # `[ERROR] hook execution error: fork/exec .../bin/<hook>: no such
+      # file or directory`. Seen on trading#3262 (3.13.14 → 3.13.15), where
+      # all four pre-commit-hooks entries errored while the C#/gitleaks
+      # hooks passed, so it reads like a diff problem rather than a cache
+      # one. The patch must be in restore-keys too: a prefix ending at X.Y
+      # just falls through to the next stale sibling, so purging one entry
+      # (or even most) doesn't clear it.
+      #
+      # Cost: a patch bump now means one cold rebuild per branch scope
+      # instead of a silently broken restore. A .pre-commit-config.yaml
+      # edit still reuses same-interpreter envs via the prefix.
       - name: Cache pre-commit hook envs
         uses: actions/cache@v6
         with:
           path: ~/.cache/pre-commit
-          key: go-pre-commit-${{ runner.os }}-py${{ inputs.python-version }}-${{ hashFiles('.pre-commit-config.yaml') }}
+          key: go-pre-commit-${{ runner.os }}-py${{ steps.setup-python.outputs.python-version }}-${{ hashFiles('.pre-commit-config.yaml') }}
           restore-keys: |
-            go-pre-commit-${{ runner.os }}-py${{ inputs.python-version }}-
+            go-pre-commit-${{ runner.os }}-py${{ steps.setup-python.outputs.python-version }}-
 
       # go-pre-commit (github.com/blairham/go-pre-commit) — drop-in Go
       # reimplementation of pre-commit; no pip install. install-only: this
