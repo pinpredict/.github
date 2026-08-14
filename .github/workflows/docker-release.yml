@@ -159,6 +159,17 @@ jobs:
       - name: Expose GitHub runtime for buildx gha cache
         uses: crazy-max/ghaction-github-runtime@v3
 
+      # Register QEMU binfmt handlers so buildx can build the non-native
+      # platforms the repos' .stevedore.yaml files list (linux/arm64 alongside
+      # linux/amd64 — dev rigs on Apple Silicon pull the arm64 variant). GitHub
+      # runners ship no binfmt handlers, so without this a multi-platform
+      # `buildx build` fails on the first foreign-arch stage. Harmless for
+      # callers that still build amd64-only. The stevedore action's own
+      # setup-buildx step creates the docker-container builder that consumes
+      # these handlers.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
       # Opt-in (private-modules: true): mint a short-lived, read-only token for
       # the org-wide pinpredict-argocd App so the build can fetch private
       # pinpredict modules without vendoring. contents:read across the org (the
