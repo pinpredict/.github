@@ -1,0 +1,342 @@
+name: Docker Release (split)
+
+# Reusable split-mode image release via stevedore >= v0.0.10: one NATIVE-ARCH
+# leg per platform, running in parallel, then a merge job that assembles the
+# multi-arch manifest lists and finishes the release. No QEMU anywhere — each
+# leg builds only its own platform on a runner of that architecture.
+#
+# vs docker-release.yml (single job): that design keeps all of a repo's images
+# on one BuildKit so a build-once Dockerfile compiles once for every image
+# (pinpredict/.github#39). Split mode keeps that property PER PLATFORM: each
+# leg builds ALL planned images for its platform on one BuildKit — the shared
+# stage still compiles once per leg — and the two legs run concurrently on
+# separate machines. Wall clock ≈ one platform's single-arch build + a cheap
+# merge, instead of ~2× (cross-compile) or ~5-10× (QEMU) on one runner.
+#
+# How it fits together (blairham/stevedore#15):
+#   plan   — change detection + per-image ECR version pins, once, so both legs
+#            and the merge make identical decisions.
+#   legs   — `release --only <ids> <pins> --split <platform>`: builds and
+#            pushes per-arch images UNTAGGED, by digest, recording digests
+#            under dist/digests/ (shared with merge via artifacts).
+#   merge  — `stevedore merge --only <ids> <pins>`: stitches the digests into
+#            one tagged manifest list per image (buildx imagetools create) and
+#            runs the release tail. It refuses to publish while any configured
+#            platform lacks a digest, so a failed leg can never ship a partial
+#            image. Marker refs advance HERE — "released" = merged + published.
+#
+# Version safety without cross-job locking: legs push no tags, so the ECR
+# "highest X.Y.Z + bump" resolution the merge performs sees exactly what the
+# plan saw; the pins make it explicit. The docker-release concurrency group
+# (shared with the single-job workflow) serializes releases per repo.
+#
+# Layer cache (`cache` input):
+#   gha      — type=gha with ONE SCOPE PER PLATFORM (scope=stevedore-<plat>).
+#              A shared scope would let the two legs' divergent build stages
+#              (TARGETARCH differs) evict each other under the 10GB repo cap.
+#   registry — type=registry into <REGISTRY>/<repo>/buildcache:<plat>, no size
+#              cap and same-region to the push. Best for big build stages
+#              (trading's .NET compile). The buildcache ECR repo must exist
+#              (create it in platform-gitops like any image repo) and the
+#              repo's push role must cover it.
+#   none     — no cache flags exported; configs' env-gated entries render
+#              empty and are skipped.
+#
+# Not supported here: `no-push` (a split leg IS a push — by digest); use
+# docker-release.yml for validation builds. Callers with single-platform
+# images should also stay on docker-release.yml — split buys nothing there.
+#
+# Runners: amd64 defaults to a GitHub-hosted runner. arm64 defaults to
+# ubuntu-24.04-arm, which is FREE ONLY FOR PUBLIC REPOS — private repos must
+# pass their own label (org larger runners, or the self-hosted EKS/ARC runner
+# labels) via `arm64-runner`.
+
+on:
+  workflow_call:
+    inputs:
+      changed-since:
+        description: "git ref to diff against for change detection (e.g. the pushed-before SHA)."
+        required: false
+        type: string
+        default: ""
+      only:
+        description: "Comma-separated image ids to release, 'all' to force every image, or empty for change detection. Feeds workflow_dispatch service pickers."
+        required: false
+        type: string
+        default: ""
+      private-modules:
+        description: "Mint a short-lived read-only pinpredict-argocd App token as GH_PRIVATE_TOKEN for BuildKit --secret private-module fetches (same contract as docker-release.yml)."
+        required: false
+        type: boolean
+        default: false
+      parallel:
+        description: "Build up to N images concurrently within each leg."
+        required: false
+        type: number
+        default: 4
+      amd64-runner:
+        description: "runs-on label for the linux/amd64 leg."
+        required: false
+        type: string
+        default: "ubuntu-24.04"
+      arm64-runner:
+        description: "runs-on label for the linux/arm64 leg. The default is free for PUBLIC repos only — private repos pass an org larger-runner or self-hosted (EKS/ARC) label."
+        required: false
+        type: string
+        default: "ubuntu-24.04-arm"
+      cache:
+        description: "Layer-cache backend: gha (per-platform scope), registry (<REGISTRY>/<repo>/buildcache:<platform> — repo must exist), or none."
+        required: false
+        type: string
+        default: "gha"
+      stevedore-version:
+        description: "stevedore release to use (>= v0.0.10 for --split/merge)."
+        required: false
+        type: string
+        default: "v0.0.10"
+
+env:
+  AWS_REGION: us-east-1
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+concurrency:
+  group: docker-release
+  cancel-in-progress: false
+
+jobs:
+  # Decide once: which images release, at which pinned versions. Both legs and
+  # the merge splice these in verbatim, so every job tags/builds identically.
+  plan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # fetch marker refs for change detection
+      id-token: write # AWS OIDC — ECR version resolution
+    outputs:
+      only: ${{ steps.decide.outputs.only }}
+      pins: ${{ steps.decide.outputs.pins }}
+      any: ${{ steps.decide.outputs.any }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Configure AWS credentials
+        uses: pinpredict/.github/actions/configure-aws-with-retry@main
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN || format('arn:aws:iam::784682930591:role/xp-{0}-gha-push', github.event.repository.name) }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # Manual `only` bypasses change detection entirely (same contract as
+      # docker-release.yml); otherwise `stevedore plan` decides.
+      - name: Resolve manual selection
+        id: manual
+        env:
+          ONLY: ${{ inputs.only }}
+        run: |
+          set -euo pipefail
+          only="${ONLY//[[:space:]]/}"
+          if [ "$only" = "all" ]; then
+            only=$(yq -r '[.images[].id] | join(",")' .stevedore.yaml)
+            [ -n "$only" ] || { echo "::error::No image ids found in .stevedore.yaml"; exit 1; }
+          elif [ -n "$ONLY" ] && [ -z "$only" ]; then
+            echo "::error::only must be 'all' or a comma-separated image list"
+            exit 1
+          fi
+          echo "value=${only}" >> "$GITHUB_OUTPUT"
+
+      - name: Stevedore plan
+        id: plan
+        if: ${{ steps.manual.outputs.value == '' }}
+        uses: blairham/stevedore@v0.0.10
+        env:
+          REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+        with:
+          command: plan
+          version: ${{ inputs.stevedore-version }}
+          args: ${{ inputs.changed-since != '' && format('--changed-since {0}', inputs.changed-since) || '' }}
+          install-cosign: "false"
+          install-syft: "false"
+          install-grype: "false"
+
+      - name: Decide release set
+        id: decide
+        env:
+          MANUAL: ${{ steps.manual.outputs.value }}
+          PLAN: ${{ steps.plan.outputs.plan }}
+        run: |
+          set -euo pipefail
+          if [ -n "$MANUAL" ]; then
+            { echo "only=$MANUAL"; echo "pins="; echo "any=true"; } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          only=$(jq -r '[.include[].only] | join(",")' <<<"$PLAN")
+          pins=$(jq -r '[.include[].pins] | join(" ")' <<<"$PLAN")
+          any=$(jq -r '.include | length > 0' <<<"$PLAN")
+          { echo "only=$only"; echo "pins=$pins"; echo "any=$any"; } >> "$GITHUB_OUTPUT"
+
+  # One leg per platform, on a runner of that architecture. Each leg builds
+  # every planned image for its platform and pushes untagged, by digest.
+  build:
+    needs: plan
+    if: ${{ needs.plan.outputs.any == 'true' }}
+    strategy:
+      fail-fast: true # a dead leg means merge can't publish anyway
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ${{ inputs.amd64-runner }}
+          - platform: linux/arm64
+            runner: ${{ inputs.arm64-runner }}
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      id-token: write # AWS OIDC (ECR push)
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Configure AWS credentials
+        uses: pinpredict/.github/actions/configure-aws-with-retry@main
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN || format('arn:aws:iam::784682930591:role/xp-{0}-gha-push', github.event.repository.name) }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # buildx's type=gha backend reads ACTIONS_CACHE_URL/ACTIONS_RUNTIME_TOKEN,
+      # which GitHub only hands to action steps — re-export them for stevedore's
+      # shelled-out buildx. No-op for the other cache backends.
+      - name: Expose GitHub runtime for buildx gha cache
+        if: ${{ inputs.cache == 'gha' }}
+        uses: crazy-max/ghaction-github-runtime@v3
+
+      - name: Compose cache exports
+        env:
+          CACHE: ${{ inputs.cache }}
+          PLATFORM: ${{ matrix.platform }}
+          REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          REPO: ${{ github.event.repository.name }}
+        run: |
+          set -euo pipefail
+          plat="${PLATFORM//\//-}"
+          case "$CACHE" in
+            gha)
+              {
+                echo "STEVEDORE_CACHE_FROM=type=gha,scope=stevedore-${plat}"
+                echo "STEVEDORE_CACHE_TO=type=gha,mode=max,scope=stevedore-${plat}"
+              } >> "$GITHUB_ENV"
+              ;;
+            registry)
+              ref="${REGISTRY}/${REPO}/buildcache:${plat}"
+              {
+                echo "STEVEDORE_CACHE_FROM=type=registry,ref=${ref}"
+                echo "STEVEDORE_CACHE_TO=type=registry,ref=${ref},mode=max,image-manifest=true,oci-mediatypes=true"
+              } >> "$GITHUB_ENV"
+              ;;
+            none) ;;
+            *) echo "::error::cache must be gha, registry, or none"; exit 1 ;;
+          esac
+
+      - name: Mint private-module read token
+        id: private-module-token
+        if: ${{ inputs.private-modules }}
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.BOOTSTRAP_APP_ID }}
+          private-key: ${{ secrets.BOOTSTRAP_APP_PRIVATE_KEY }}
+          owner: pinpredict
+          permission-contents: read
+
+      - name: Stevedore split leg
+        uses: blairham/stevedore@v0.0.10
+        env:
+          REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          GH_PRIVATE_TOKEN: ${{ steps.private-module-token.outputs.token }}
+        with:
+          command: release
+          version: ${{ inputs.stevedore-version }}
+          args: --only ${{ needs.plan.outputs.only }} ${{ needs.plan.outputs.pins }} --split ${{ matrix.platform }} --parallel ${{ inputs.parallel }}
+          install-cosign: "false"
+          install-syft: "false"
+          install-grype: "false"
+
+      # dist/digests/<image-id>/<platform> — merge downloads every leg's tree.
+      - name: Share digests with merge
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ strategy.job-index }}
+          path: dist/digests/
+          if-no-files-found: error
+          retention-days: 1
+
+  # Assemble the manifest lists and finish the release: scan/test gates, sign,
+  # SBOM, markers, Dispatch notification — all against the merged digest.
+  merge:
+    needs: [plan, build]
+    if: ${{ needs.plan.outputs.any == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # push refs/releases/image/* marker refs on publish
+      id-token: write # AWS OIDC (ECR)
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Configure AWS credentials
+        uses: pinpredict/.github/actions/configure-aws-with-retry@main
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN || format('arn:aws:iam::784682930591:role/xp-{0}-gha-push', github.event.repository.name) }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+        id: ecr-login
+
+      - name: Collect leg digests
+        uses: actions/download-artifact@v4
+        with:
+          pattern: digests-*
+          path: dist/digests/
+          merge-multiple: true
+
+      - name: Stevedore merge
+        id: stevedore
+        uses: blairham/stevedore@v0.0.10
+        env:
+          REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+        with:
+          command: merge
+          version: ${{ inputs.stevedore-version }}
+          args: --only ${{ needs.plan.outputs.only }} ${{ needs.plan.outputs.pins }}
+          setup-buildx: "false" # imagetools needs no builder
+          install-cosign: "false"
+          install-syft: "false"
+          install-grype: "false"
+
+      # One publish notification per PUSHED image, from stevedore's release
+      # summary — same contract as docker-release.yml.
+      - name: Build Dispatch batch
+        id: dispatch-batch
+        if: ${{ steps.stevedore.outputs.summary != '' }}
+        env:
+          SUMMARY: ${{ steps.stevedore.outputs.summary }}
+        run: |
+          set -euo pipefail
+          batch=$(jq -c '[(.images // [])[] | select(.pushed and (.skipped | not)) | {kind: "image", service: .id, version: .version}]' <<<"${SUMMARY}")
+          echo "value=${batch}" >> "$GITHUB_OUTPUT"
+          echo "Pushed images to notify: $(jq -r 'length' <<<"${batch}")"
+
+      - name: Notify Dispatch
+        if: ${{ steps.dispatch-batch.outputs.value && steps.dispatch-batch.outputs.value != '[]' }}
+        uses: pinpredict/.github/actions/notify-dispatch@main
+        with:
+          batch: ${{ steps.dispatch-batch.outputs.value }}
+          secret: ${{ secrets.CI_WEBHOOK_SECRET }}
