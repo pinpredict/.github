@@ -198,6 +198,40 @@ jobs:
               ;;
           esac
 
+      # The Go hook caches below are large (~1.7GB compressed in k5s: 40-50s
+      # to restore, ~70s to save) and only serve the diff-triggered
+      # `language: golang` hooks, which skip entirely when the run's diff
+      # touches nothing Go-relevant. On such runs the transfer is pure waste
+      # — measured on k5s#99 (workflows-only diff): 52s of Go cache restore
+      # wrapped around a 1s hook run. Detect Go-relevant changes once and
+      # gate every Go cache step on it. Skipping the SEED on a non-Go push
+      # is strictly correct, not just cheap: the push changed no Go analysis
+      # input, so the previously saved cache is still exact — the restore-keys
+      # prefix serves it regardless of which sha it was saved under. When the
+      # base sha is unavailable (branch create, force-push zeros), default to
+      # 'true': the failure mode must be a wasted restore, never a cold Go PR.
+      - name: Detect Go-relevant changes
+        id: go-changes
+        if: hashFiles('**/go.sum') != ''
+        env:
+          DIFF_BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          DIFF_HEAD: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          if [ -z "$DIFF_BASE" ] || ! git cat-file -e "$DIFF_BASE" 2>/dev/null; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "Diff base unavailable ('${DIFF_BASE:-empty}') — assuming Go-relevant changes"
+            exit 0
+          fi
+          if git diff --name-only "$DIFF_BASE" "$DIFF_HEAD" | \
+             grep -qE '\.go$|(^|/)go\.(mod|sum)$|(^|/)\.golangci\.|^\.pre-commit-config\.yaml$'; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "Go-relevant files in diff — Go caches will be restored"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No Go-relevant files in diff — skipping Go cache transfer"
+          fi
+
       # Go caches for the `language: golang` hooks (go-mod-tidy-repo,
       # golangci-lint). pre-commit diff-scopes the *trigger* (the hooks are
       # skipped when no .go file changed), but the hooks themselves are
@@ -209,9 +243,10 @@ jobs:
       # above. Restore-only here: PR runs never save (a per-sha, ~0.5-1GB
       # cache per push would churn the repo's 10GB cache budget); the
       # push-to-default-branch seed run saves below, so PRs restore a cache
-      # at most one merge behind.
+      # at most one merge behind (one Go-touching merge, since the gate
+      # above also skips no-op seeds).
       - name: Restore Go hook caches
-        if: hashFiles('**/go.sum') != ''
+        if: hashFiles('**/go.sum') != '' && steps.go-changes.outputs.changed == 'true'
         uses: actions/cache/restore@v6
         with:
           path: |
@@ -284,13 +319,13 @@ jobs:
       # org-wide debt on purpose here, and repos without one of these hook
       # ids just skip it.
       - name: Warm Go hook caches (cache seed)
-        if: github.event_name == 'push' && hashFiles('**/go.sum') != ''
+        if: github.event_name == 'push' && hashFiles('**/go.sum') != '' && steps.go-changes.outputs.changed == 'true'
         run: |
           pre-commit run go-mod-tidy-repo --all-files || true
           pre-commit run golangci-lint --all-files || true
 
       - name: Save Go hook caches (cache seed)
-        if: github.event_name == 'push' && hashFiles('**/go.sum') != ''
+        if: github.event_name == 'push' && hashFiles('**/go.sum') != '' && steps.go-changes.outputs.changed == 'true'
         uses: actions/cache/save@v6
         with:
           path: |
