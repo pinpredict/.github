@@ -46,10 +46,13 @@ name: Docker Release (split)
 # docker-release.yml for validation builds. Callers with single-platform
 # images should also stay on docker-release.yml — split buys nothing there.
 #
-# Runners: amd64 defaults to a GitHub-hosted runner. arm64 defaults to
-# ubuntu-24.04-arm, which is FREE ONLY FOR PUBLIC REPOS — private repos must
-# pass their own label (org larger runners, or the self-hosted EKS/ARC runner
-# labels) via `arm64-runner`.
+# Runners: the legs default to the org's self-hosted EKS/ARC runner scale
+# sets — pinpredict-dev (amd64) and pinpredict-dev-arm64 (arm64). With ARC
+# the scale set name IS the runs-on label (scale sets take no extra labels).
+# Same-VPC to ECR, so image pushes and registry-cache traffic stay local.
+# Pass amd64-runner/arm64-runner to override — e.g. GitHub-hosted
+# ubuntu-24.04 / ubuntu-24.04-arm (arm64 standard runners work in private
+# repos since 2026-01, at 2 vCPU).
 
 on:
   workflow_call:
@@ -75,15 +78,15 @@ on:
         type: number
         default: 4
       amd64-runner:
-        description: "runs-on label for the linux/amd64 leg."
+        description: "runs-on label for the linux/amd64 leg. Defaults to the EKS/ARC amd64 scale set."
         required: false
         type: string
-        default: "ubuntu-24.04"
+        default: "pinpredict-dev"
       arm64-runner:
-        description: "runs-on label for the linux/arm64 leg. The default is free for PUBLIC repos only — private repos pass an org larger-runner or self-hosted (EKS/ARC) label."
+        description: "runs-on label for the linux/arm64 leg. Defaults to the EKS/ARC arm64 scale set."
         required: false
         type: string
-        default: "ubuntu-24.04-arm"
+        default: "pinpredict-dev-arm64"
       cache:
         description: "Layer-cache backend: gha (per-platform scope), registry (<REGISTRY>/<repo>/buildcache:<platform> — repo must exist), or none."
         required: false
