@@ -4,10 +4,20 @@ description: |
   recipe for pinpredict Go repos (service-template and anything templated
   from it).
 
-  actions/setup-go@v6 caches the Go SDK + module cache by default; warm
-  runs skip both downloads. Reading the version from go.mod means the
-  caller doesn't pin Go in two places — bumping `go x.yy.z` in go.mod
-  drives CI.
+  Caches the Go module + build caches per CALLING JOB (the cache key
+  includes `github.job`) instead of using setup-go@v6's built-in cache.
+  The built-in cache keys once per go.sum for the whole repo, so the
+  first job to save wins the key and every sibling job restores
+  artifacts compiled with the wrong flags, recompiles from scratch, and
+  never saves its own ("Cache hit occurred on the primary key …, not
+  saving cache"). Concretely: a `go test -race -coverprofile` job kept
+  restoring the build job's plain artifacts and recompiled the entire
+  dependency graph on every run (~3.5 min in k5s against ~30 s of actual
+  test time). Per-job keys keep each flag set (plain build, race+cover
+  test, goreleaser) warm independently. `cache-name` overrides the
+  scope for jobs that should share; `cache-name: "false"` disables
+  caching. Reading the version from go.mod means the caller doesn't pin
+  Go in two places — bumping `go x.yy.z` in go.mod drives CI.
 
   Optional `private-modules: true` mints a short-lived, read-only
   pinpredict-argocd App token and configures git + GOPRIVATE so `go`,
@@ -21,6 +31,15 @@ inputs:
     description: "Path to go.mod (or any file with a `go` directive)."
     required: false
     default: "go.mod"
+  cache-name:
+    description: >-
+      Scope name for the Go module + build cache. Empty (the default)
+      scopes the cache to the calling job's id (`github.job`), so each
+      job's differently-flagged compile artifacts stay warm
+      independently. Set a fixed name to share one cache between jobs
+      that compile identically, or "false" to skip caching entirely.
+    required: false
+    default: ""
   private-modules:
     description: >-
       When true, mint a read-only pinpredict-argocd App token from
@@ -51,6 +70,29 @@ runs:
       uses: actions/setup-go@v6
       with:
         go-version-file: ${{ inputs.go-version-file }}
+        # Built-in caching stays off: it keys ONE cache per go.sum for every
+        # job in the repo, so only the first job to save ever populates it and
+        # differently-flagged sibling jobs (e.g. `go test -race -cover…`)
+        # recompile the world on every run. The per-job cache below replaces it.
+        cache: false
+
+    # Module + build caches, scoped per calling job (or per `cache-name`).
+    # restore-keys fall back first to the same scope with an older go.sum
+    # (near-warm after a dep bump), then to any scope (a cold test job still
+    # inherits the build job's module download cache). Paths are the Linux
+    # defaults — every pinpredict runner (GitHub-hosted and the EKS/ARC scale
+    # sets) is Linux; a macOS caller would just miss the cache, not break.
+    - name: Restore Go module + build caches
+      if: ${{ inputs.cache-name != 'false' }}
+      uses: actions/cache@v6
+      with:
+        path: |
+          ~/go/pkg/mod
+          ~/.cache/go-build
+        key: setup-go-job-${{ runner.os }}-${{ runner.arch }}-${{ inputs.cache-name || github.job }}-${{ hashFiles(inputs.go-version-file, '**/go.sum') }}
+        restore-keys: |
+          setup-go-job-${{ runner.os }}-${{ runner.arch }}-${{ inputs.cache-name || github.job }}-
+          setup-go-job-${{ runner.os }}-${{ runner.arch }}-
 
     # Opt-in (private-modules: true): mint a short-lived, read-only token for
     # the org-wide pinpredict-argocd App so `go mod download` / golangci /
