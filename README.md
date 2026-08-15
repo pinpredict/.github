@@ -28,7 +28,7 @@ Why `.github` and not a dedicated `github-actions` repo: `.github` is *the* GitH
 | `setup-python-uv` | Install uv + a pinned Python version + (default-on) `uv sync`. |
 | `setup-node-pnpm` | corepack + setup-node@v4 with pnpm cache + (default-on) `pnpm install --frozen-lockfile`. Accepts a `pnpm-filter` input for workspace filtering. |
 | `setup-dotnet` | setup-dotnet@v5 with NuGet cache keyed on `**/*.csproj` + (default-off) `dotnet tool restore`. |
-| `setup-go` | setup-go@v6 reading version from `go.mod`. Optional `private-modules: true` mints a short-lived read-only `pinpredict-argocd` App token and configures git + `GOPRIVATE` so `go`/`golangci-lint`/`goreleaser` fetch a private pinpredict module (e.g. `github.com/pinpredict/ppkit`) without vendoring — the non-Docker analogue of `docker-release.yml`'s `private-modules` secret. Default false. |
+| `setup-go` | setup-go@v6 reading version from `go.mod`. Optional `private-modules: true` mints a short-lived read-only `pinpredict-argocd` App token and configures git + `GOPRIVATE` so `go`/`golangci-lint`/`goreleaser` fetch a private pinpredict module (e.g. `github.com/pinpredict/ppkit`) without vendoring — the non-Docker analogue of `docker-release.yml`'s `private-modules` secret. Default false. Optional `release-cache: true` (goreleaser jobs only) swaps the built-in cache for a release-scoped module+build cache with a `restore-keys` fallback, saved **after** goreleaser so it covers every cross-compiled GOOS/GOARCH target — the built-in cache is exact-match on `go.sum` and is usually saved by a CI test job whose build cache warms none of the release targets. Default false. |
 
 #### Language setup composites — usage
 

@@ -16,11 +16,30 @@ description: |
   This is the non-Docker analogue of docker-release.yml's `private-modules`
   BuildKit secret. Default false — a no-op for every existing caller.
 
+  Optional `release-cache: true` swaps setup-go's built-in cache for a
+  release-scoped one (see the input description) — set it on goreleaser
+  jobs, leave it off everywhere else.
+
 inputs:
   go-version-file:
     description: "Path to go.mod (or any file with a `go` directive)."
     required: false
     default: "go.mod"
+  release-cache:
+    description: >-
+      When true, replace setup-go's built-in cache with a release-scoped
+      module + build cache. The built-in cache is wrong for goreleaser jobs
+      twice over: its key is exact-match on go.sum (any dependency bump means
+      a fully cold build), and its snapshot is saved by whichever job first
+      claims the key — usually a CI test job, whose GOCACHE holds only
+      host-platform test builds and warms none of the cross-compile targets.
+      The `go-release-` cache is namespaced away from CI, falls back on a
+      restore-keys prefix when go.sum changed, and — because the post step
+      saves it after goreleaser has built every GOOS/GOARCH target — the next
+      release restores a build cache that covers the full target matrix.
+      Default false (built-in cache, exactly as before).
+    required: false
+    default: "false"
   private-modules:
     description: >-
       When true, mint a read-only pinpredict-argocd App token from
@@ -51,6 +70,23 @@ runs:
       uses: actions/setup-go@v6
       with:
         go-version-file: ${{ inputs.go-version-file }}
+        # Under release-cache the explicit cache step below takes over.
+        cache: ${{ inputs.release-cache == 'true' && 'false' || 'true' }}
+
+    # Release-scoped Go cache (release-cache: true). go.mod is in the key so a
+    # toolchain bump also rolls the cache; restore-keys keeps a dependency
+    # bump warm instead of cold. Saved by the post step at job end — after
+    # goreleaser — so the snapshot carries every cross-compiled target.
+    - name: Restore release Go cache
+      if: ${{ inputs.release-cache == 'true' }}
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/go/pkg/mod
+          ~/.cache/go-build
+        key: go-release-${{ runner.os }}-${{ hashFiles('go.mod', 'go.sum') }}
+        restore-keys: |
+          go-release-${{ runner.os }}-
 
     # Opt-in (private-modules: true): mint a short-lived, read-only token for
     # the org-wide pinpredict-argocd App so `go mod download` / golangci /
