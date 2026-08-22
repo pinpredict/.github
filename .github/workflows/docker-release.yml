@@ -203,6 +203,16 @@ jobs:
           # entries simply ignore these.
           STEVEDORE_CACHE_FROM: "type=gha,scope=stevedore"
           STEVEDORE_CACHE_TO: "type=gha,mode=max,scope=stevedore"
+          # stevedore's release step shells out to `gh release create`, which
+          # authenticates from GH_TOKEN and takes no token flag. Without it the
+          # image publishes and the job THEN dies on `gh: exit status 4`, so a
+          # red run sits behind a completed push and the tag gets no GitHub
+          # Release (pinpredict/.github#63, understudy#225). The job's
+          # `contents: write` above is what lets this token create the release.
+          # Not to be confused with GH_PRIVATE_TOKEN below: that one is a minted
+          # App token with contents:read, for fetching private modules inside
+          # the BUILD, and it cannot create a release.
+          GH_TOKEN: ${{ github.token }}
           # Empty unless private-modules minted a token above. The repo's
           # .stevedore.yaml declares `secrets: [{id: gh_token, env:
           # GH_PRIVATE_TOKEN}]`; when private-modules is true this is populated,
