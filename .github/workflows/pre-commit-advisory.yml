@@ -48,6 +48,28 @@ on:
         description: "Node version. Ignored when setup-node-pnpm=false."
         type: string
         default: "24"
+      setup-terraform:
+        description: |
+          When true, install Terraform before running pre-commit. Required
+          when the repo has pre-commit-terraform hooks (terraform_fmt,
+          terraform_validate). They shell out to a `terraform` binary and
+          exit 127 — "Neither Terraform nor OpenTofu binary could be found"
+          — when none is on PATH, which surfaces in the advisory comment as
+          if the PR's diff were at fault. Unlike setup-dotnet /
+          setup-node-pnpm there is no dependency-restore step: the hooks
+          need the binary and nothing else. Default false — a no-op for
+          every existing caller.
+        required: false
+        type: boolean
+        default: false
+      terraform-version:
+        description: >-
+          Terraform version to install. Ignored when setup-terraform=false.
+          Empty (the default) reads the version from the repo's
+          `.tool-versions`, falling back to `latest` when the repo pins none.
+        required: false
+        type: string
+        default: ""
       private-modules:
         description: >-
           When true, mint a short-lived read-only pinpredict-argocd App token
@@ -301,6 +323,39 @@ jobs:
       - name: Install Node workspace deps
         if: inputs.setup-node-pnpm
         run: pnpm install --frozen-lockfile
+
+      # Optional: install Terraform for the pre-commit-terraform hooks.
+      #
+      # Version resolution prefers the repo's own asdf pin over a version
+      # hardcoded here, for the same reason the GOTOOLCHAIN step above reads
+      # go.mod: `terraform fmt` output is version-sensitive, so a CI binary
+      # that drifts from the one engineers run locally would flag formatting
+      # nobody can reproduce. Mirrors setup-dotnet/setup-node-pnpm in being
+      # opt-in, but needs no dependency-restore step.
+      - name: Resolve Terraform version
+        if: inputs.setup-terraform
+        id: tf-version
+        env:
+          REQUESTED: ${{ inputs.terraform-version }}
+        run: |
+          set -euo pipefail
+          ver="$REQUESTED"
+          if [ -z "$ver" ] && [ -f .tool-versions ]; then
+            ver=$(awk '$1 == "terraform" { print $2; exit }' .tool-versions)
+          fi
+          printf 'version=%s\n' "${ver:-latest}" >> "$GITHUB_OUTPUT"
+          echo "Terraform version: ${ver:-latest}"
+
+      # terraform_wrapper: false — setup-terraform's default wrapper replaces
+      # `terraform` with a shim that captures stdout/stderr to republish them
+      # as step outputs. The hooks parse terraform's output directly, so the
+      # shim's framing corrupts what they read.
+      - name: Set up Terraform
+        if: inputs.setup-terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ steps.tf-version.outputs.version }}
+          terraform_wrapper: false
 
       # Push-to-default-branch runs exist only to populate
       # ~/.cache/pre-commit (and ~/.dotnet/tools / pnpm store) into
