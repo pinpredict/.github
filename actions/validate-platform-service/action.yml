@@ -214,14 +214,41 @@ runs:
           # placeholders for the ApplicationSet-supplied values so
           # the only way the template fails is if the engineer-yaml
           # is incomplete.
+          #
+          # `environments: []` is a deliberate state, not a mistake: it
+          # parks a service that has artifacts but no approved deployment
+          # target yet. The chart renders it cleanly — every env-scoped
+          # manifest gates on `has .Values.env .Values.environments`, so a
+          # parked spec emits only the ECR claim and the Kargo Warehouses
+          # (both key off `repositories:`). Failing it here would force
+          # engineers back to the thing parking exists to stop: writing a
+          # placeholder env like `dev`, which the platform then honours by
+          # standing up real Stages that can never take Freight.
+          #
+          # A missing or non-list `environments:` is still an error — that
+          # is a typo, and it would silently skip the render loop below,
+          # leaving the spec with zero validation coverage. Distinguish the
+          # two by the node's tag rather than by emptiness.
+          parked=0
+          if [ "$(yq -r '.environments | tag' "$yaml")" != '!!seq' ]; then
+            echo "::error file=$yaml::environments[] is missing or not a list"
+            fail=1; continue
+          fi
           envs=$(yq -r '.environments[]' "$yaml")
           if [ -z "$envs" ]; then
-            echo "::error file=$yaml::environments[] is empty"
-            fail=1; continue
+            # Still render once, so a parked spec keeps full template and
+            # schema coverage. The env chosen is immaterial — it is not in
+            # the (empty) list, so nothing env-scoped renders either way.
+            parked=1
+            envs=stg
           fi
 
           for env in $envs; do
-            echo "  rendering env=$env"
+            if [ "$parked" -eq 1 ]; then
+              echo "  environments: [] — service is parked; rendering env=$env for coverage only"
+            else
+              echo "  rendering env=$env"
+            fi
             # Use --set-string for the renderXxx flags and ecrAccountId:
             # the chart's values.schema.json types them as strings to
             # mirror how ApplicationSets pass them (`helm.parameters`
