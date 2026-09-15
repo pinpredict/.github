@@ -25,6 +25,15 @@ on:
         required: false
         type: string
         default: ""
+      role:
+        description: >-
+          IAM role ARN to assume for ECR push. Only needed when the chart has no
+          matching `.platform/services/<chart-name>.yaml` to derive a per-service
+          role from — i.e. a chart published from a repo that is not a deployed
+          service. Ignored when a per-service role resolves.
+        required: false
+        type: string
+        default: ""
   workflow_dispatch:
     inputs:
       only:
@@ -196,13 +205,26 @@ jobs:
       # Three-shot retry on the AWS AssumeRole to survive a
       # first-colocation race with Crossplane minting the per-service
       # xp-<svc>-gha-push role (pinpredict/trading#616). Empty
-      # `matrix.role` for un-migrated charts falls back to the central
-      # xp-trading-gha-push role in secrets.AWS_ROLE_ARN. See the action
+      # `matrix.role` for un-migrated charts falls back to the caller's
+      # `role` input, then to secrets.AWS_ROLE_ARN.
+      #
+      # The `role` input exists because the AWS_ROLE_ARN tail is dead: as of
+      # 2026-09-15 NO repository in the org has that secret set. Every chart
+      # released today resolves a per-service role from
+      # `.platform/services/<chart-name>.yaml`, and the composition only
+      # writes AWS_ROLE_ARN for the central one-claim-per-repo path, which
+      # nothing uses any more. A chart published from a repo that is not a
+      # deployed service — platform-gitops' charts/service-template is the
+      # first — therefore has no way to authenticate at all: matrix.role is
+      # empty, the secret is unset, and configure-aws gets "". Passing the
+      # role explicitly is the fix; it is deterministic
+      # (arn:aws:iam::<acct>:role/xp-<repo>-gha-push for a repoReleaseRoles
+      # entry) and needs no secret. See the action
       # for the full incident writeup.
       - name: Configure AWS credentials
         uses: pinpredict/.github/actions/configure-aws-with-retry@main
         with:
-          role-to-assume: ${{ matrix.role || secrets.AWS_ROLE_ARN }}
+          role-to-assume: ${{ matrix.role || inputs.role || secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Log in to Amazon ECR
