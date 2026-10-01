@@ -53,6 +53,8 @@ It posts a sticky PR comment with hook output and fails the job (so engineers se
 
 The **push-to-default-branch run is `continue-on-error`** — it only seeds caches (its hook steps end in `|| true`, and the exit-code-reflecting step is `pull_request`-only), so it gates nothing and must never redden a service repo's default branch. It previously could, via an infrastructure step rather than a hook: a transient `curl: (35) Recv failure` fetching the go-pre-commit release archive failed an otherwise-green k5s main. A failed seed costs PRs a cold cache, nothing more. Keep PR runs failing loudly — that ❌ is what makes the advisory comment worth reading.
 
+The seed **builds its Go hook cache from cold** — only PR runs restore it. A seed that restored, added, and re-saved never let anything go, so the cache only grew (legate: 2.13 GiB compressed against 0.45 GiB cold) until a PR run filled the runner's disk unpacking it (legate run 36781099865). Do not add the restore back to push runs.
+
 ## Editing playbook
 
 - **Changing the docker matrix shape** in `discover-services/action.yml`: its docker-release consumer now lives only on the frozen `@pre-stevedore` tag (never retarget it) — pinned callers' `ci.yml` files still read the matrix output, so treat the shape as frozen until the stevedore migration completes.
