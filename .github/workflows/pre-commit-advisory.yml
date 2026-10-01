@@ -235,7 +235,8 @@ jobs:
               ;;
           esac
 
-      # The Go hook caches below are large (~1.7GB compressed in k5s: 40-50s
+      # The Go hook caches below are large (~1.7GB compressed in k5s, though
+      # much of that was accumulation, see the restore step: 40-50s
       # to restore, ~70s to save) and only serve the diff-triggered
       # `language: golang` hooks, which skip entirely when the run's diff
       # touches nothing Go-relevant. On such runs the transfer is pure waste
@@ -282,8 +283,19 @@ jobs:
       # push-to-default-branch seed run saves below, so PRs restore a cache
       # at most one merge behind (one Go-touching merge, since the gate
       # above also skips no-op seeds).
+      #
+      # PR runs only: the seed must build from COLD. When it restored too, each
+      # seed saved "the previous cache plus whatever this run added", and nothing
+      # ever left — superseded module versions, every auto-provisioned toolchain,
+      # stale build output. The cache only ratcheted up: legate's reached 2.13 GiB
+      # compressed against 0.45 GiB for a cold run of the same main, and on
+      # 2026-09-30 a PR run ran the runner out of disk unpacking it
+      # (legate run 36781099865: `tar: ... .cache/golangci-lint/...: Cannot
+      # write: No space left on device`). Building cold, the saved cache is
+      # exactly what the current main needs. The cold lint costs minutes on a
+      # push run that gates nothing.
       - name: Restore Go hook caches
-        if: hashFiles('**/go.sum') != '' && steps.go-changes.outputs.changed == 'true'
+        if: github.event_name == 'pull_request' && hashFiles('**/go.sum') != '' && steps.go-changes.outputs.changed == 'true'
         uses: actions/cache/restore@v6
         with:
           path: |
