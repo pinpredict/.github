@@ -100,7 +100,10 @@ on:
         # advance FAILS the merge job after publish instead of warning
         # (blairham/stevedore#3). A marker left on a never-merged commit used to
         # turn every later release into a silent full rebuild behind a green job.
-        default: "v1.0.1"
+        # v1.0.2 = the action pins its own actions by SHA and installs grype/crane
+        # from pinned versions instead of `@latest` / `curl | sh` of a branch
+        # (blairham/stevedore#8).
+        default: "v1.0.2"
 
 env:
   AWS_REGION: us-east-1
@@ -158,7 +161,7 @@ jobs:
       - name: Stevedore plan
         id: plan
         if: ${{ steps.manual.outputs.value == '' }}
-        uses: blairham/stevedore@v1.0.1
+        uses: blairham/stevedore@v1.0.2
         env:
           REGISTRY: ${{ steps.ecr-login.outputs.registry }}
         with:
@@ -262,7 +265,7 @@ jobs:
           permission-contents: read
 
       - name: Stevedore split leg
-        uses: blairham/stevedore@v1.0.1
+        uses: blairham/stevedore@v1.0.2
         env:
           REGISTRY: ${{ steps.ecr-login.outputs.registry }}
           GH_PRIVATE_TOKEN: ${{ steps.private-module-token.outputs.token }}
@@ -316,7 +319,7 @@ jobs:
 
       - name: Stevedore merge
         id: stevedore
-        uses: blairham/stevedore@v1.0.1
+        uses: blairham/stevedore@v1.0.2
         env:
           REGISTRY: ${{ steps.ecr-login.outputs.registry }}
         with:
