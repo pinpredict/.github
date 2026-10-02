@@ -96,7 +96,11 @@ on:
         description: "stevedore release to use (>= v0.0.10 for --split/merge)."
         required: false
         type: string
-        default: "v0.0.10"
+        # v1.0.1 = release markers only fast-forward, and a marker that cannot
+        # advance FAILS the merge job after publish instead of warning
+        # (blairham/stevedore#3). A marker left on a never-merged commit used to
+        # turn every later release into a silent full rebuild behind a green job.
+        default: "v1.0.1"
 
 env:
   AWS_REGION: us-east-1
@@ -154,7 +158,7 @@ jobs:
       - name: Stevedore plan
         id: plan
         if: ${{ steps.manual.outputs.value == '' }}
-        uses: blairham/stevedore@v0.0.10
+        uses: blairham/stevedore@v1.0.1
         env:
           REGISTRY: ${{ steps.ecr-login.outputs.registry }}
         with:
@@ -258,7 +262,7 @@ jobs:
           permission-contents: read
 
       - name: Stevedore split leg
-        uses: blairham/stevedore@v0.0.10
+        uses: blairham/stevedore@v1.0.1
         env:
           REGISTRY: ${{ steps.ecr-login.outputs.registry }}
           GH_PRIVATE_TOKEN: ${{ steps.private-module-token.outputs.token }}
@@ -312,7 +316,7 @@ jobs:
 
       - name: Stevedore merge
         id: stevedore
-        uses: blairham/stevedore@v0.0.10
+        uses: blairham/stevedore@v1.0.1
         env:
           REGISTRY: ${{ steps.ecr-login.outputs.registry }}
         with:
