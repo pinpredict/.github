@@ -96,7 +96,10 @@ on:
         # private-module builds. Also carries: release summary with
         # pushed/reason fields as a step output (blairham/stevedore#9, consumed
         # by Notify Dispatch) and skip-empty cache entries (#8).
-        default: "v1.0.2"
+        # v1.0.3 = the action's own setup-go (v7) and cosign-installer (v4)
+        # bumps. Neither step runs here: both are gated on install-cosign /
+        # install-crane, which these calls leave false.
+        default: "v1.0.3"
 
 env:
   AWS_REGION: us-east-1
@@ -197,7 +200,7 @@ jobs:
         id: stevedore
         # uses: refs cannot be expressions — pin the action; the `version`
         # input below selects the binary that actually runs.
-        uses: blairham/stevedore@v1.0.2
+        uses: blairham/stevedore@v1.0.3
         env:
           # ECR host, e.g. 123456789.dkr.ecr.us-east-1.amazonaws.com — the
           # .stevedore.yaml repositories template this as {{ .Env.REGISTRY }}.

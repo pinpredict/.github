@@ -103,7 +103,10 @@ on:
         # v1.0.2 = the action pins its own actions by SHA and installs grype/crane
         # from pinned versions instead of `@latest` / `curl | sh` of a branch
         # (blairham/stevedore#8).
-        default: "v1.0.2"
+        # v1.0.3 = the action's own setup-go (v7) and cosign-installer (v4)
+        # bumps. Neither step runs here: both are gated on install-cosign /
+        # install-crane, which these calls leave false.
+        default: "v1.0.3"
 
 env:
   AWS_REGION: us-east-1
@@ -161,7 +164,7 @@ jobs:
       - name: Stevedore plan
         id: plan
         if: ${{ steps.manual.outputs.value == '' }}
-        uses: blairham/stevedore@v1.0.2
+        uses: blairham/stevedore@v1.0.3
         env:
           REGISTRY: ${{ steps.ecr-login.outputs.registry }}
         with:
@@ -265,7 +268,7 @@ jobs:
           permission-contents: read
 
       - name: Stevedore split leg
-        uses: blairham/stevedore@v1.0.2
+        uses: blairham/stevedore@v1.0.3
         env:
           REGISTRY: ${{ steps.ecr-login.outputs.registry }}
           GH_PRIVATE_TOKEN: ${{ steps.private-module-token.outputs.token }}
@@ -319,7 +322,7 @@ jobs:
 
       - name: Stevedore merge
         id: stevedore
-        uses: blairham/stevedore@v1.0.2
+        uses: blairham/stevedore@v1.0.3
         env:
           REGISTRY: ${{ steps.ecr-login.outputs.registry }}
         with:
