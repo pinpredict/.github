@@ -85,13 +85,18 @@ on:
         description: "stevedore release to use."
         required: false
         type: string
+        # v1.0.2 = release markers only fast-forward, and a marker that cannot
+        # advance FAILS the release after publish instead of warning
+        # (blairham/stevedore#3); the action pins its own actions by SHA and
+        # installs grype/crane from pinned versions (blairham/stevedore#8).
+        # Earlier floor, still required:
         # v0.0.7 = skip an env-backed build secret whose variable is unset
         # (blairham/stevedore#10) — required for the private-modules gh_token
         # secret to stay inert on callers that leave it off, and for local
         # private-module builds. Also carries: release summary with
         # pushed/reason fields as a step output (blairham/stevedore#9, consumed
         # by Notify Dispatch) and skip-empty cache entries (#8).
-        default: "v0.0.7"
+        default: "v1.0.2"
 
 env:
   AWS_REGION: us-east-1
@@ -192,7 +197,7 @@ jobs:
         id: stevedore
         # uses: refs cannot be expressions — pin the action; the `version`
         # input below selects the binary that actually runs.
-        uses: blairham/stevedore@v0.0.7
+        uses: blairham/stevedore@v1.0.2
         env:
           # ECR host, e.g. 123456789.dkr.ecr.us-east-1.amazonaws.com — the
           # .stevedore.yaml repositories template this as {{ .Env.REGISTRY }}.
