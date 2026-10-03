@@ -99,7 +99,11 @@ on:
         # v1.0.3 = the action's own setup-go (v7) and cosign-installer (v4)
         # bumps. Neither step runs here: both are gated on install-cosign /
         # install-crane, which these calls leave false.
-        default: "v1.0.3"
+        # v1.0.6 = plan diffs from the merge base when a marker has diverged
+        # instead of rebuilding every image from the stray commit, and a failed
+        # or non-fast-forward marker fetch no longer degrades to "never
+        # released" (blairham/stevedore#23). v1.0.4-v1.0.5 are docs/CI only.
+        default: "v1.0.6"
 
 env:
   AWS_REGION: us-east-1
