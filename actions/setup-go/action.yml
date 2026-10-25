@@ -19,6 +19,13 @@ description: |
   caching. Reading the version from go.mod means the caller doesn't pin
   Go in two places — bumping `go x.yy.z` in go.mod drives CI.
 
+  The key also carries a refresh window (`cache-refresh-hours`, default
+  24), and only default-branch runs save, so every PR restores a main
+  cache at most one window old instead of whichever commit first saved
+  for its go.sum. Tracked files get content-derived mtimes
+  (`normalize-mtimes`, default on) so Go's test cache also survives the
+  fresh checkout for tests that read repo files.
+
   Optional `private-modules: true` mints a short-lived, read-only
   pinpredict-argocd App token and configures git + GOPRIVATE so `go`,
   `golangci-lint`, and `goreleaser` can fetch a private pinpredict module
@@ -40,6 +47,24 @@ inputs:
       that compile identically, or "false" to skip caching entirely.
     required: false
     default: ""
+  cache-refresh-hours:
+    description: >-
+      How often a default-branch run may save a new cache entry, in whole
+      hours (windows are aligned to the Unix epoch, so 24 = one UTC day).
+      Lower keeps PRs closer to main's newest cache; higher writes fewer
+      entries against the repo's 10 GB cache cap, where superseded entries
+      wait for LRU eviction. Default 24.
+    required: false
+    default: "24"
+  normalize-mtimes:
+    description: >-
+      When true (the default), give every clean tracked file and directory
+      an mtime derived from its git object id, so Go can reuse a cached test
+      result for a test that reads repo files (testdata, charts) across
+      fresh checkouts. Set "false" for a job that relies on checkout-time
+      mtimes.
+    required: false
+    default: "true"
   private-modules:
     description: >-
       When true, mint a read-only pinpredict-argocd App token from
@@ -76,21 +101,120 @@ runs:
         # recompile the world on every run. The per-job cache below replaces it.
         cache: false
 
-    # Module + build caches, scoped per calling job (or per `cache-name`).
-    # restore-keys fall back first to the same scope with an older go.sum
+    # Go caches a test result only while every repo file the test opened keeps
+    # its size and mtime, and a fresh checkout stamps every file with the
+    # checkout time. So without this, a package whose tests read testdata or a
+    # chart reruns on every CI run however warm the cache is (legate's
+    # cmd/kalshi-fix-oegw: 155 s on every PR). Each tracked file and directory
+    # instead gets an mtime derived from its git object id: identical on every
+    # checkout of the same content, different whenever the content changes,
+    # and always in the past, so anything generated later is still newer.
+    # Paths that differ from HEAD keep their real mtime. Best effort: a
+    # failure here warns and never fails the caller's job.
+    - name: Normalize tracked-file mtimes
+      if: ${{ inputs.normalize-mtimes == 'true' }}
+      shell: bash
+      env:
+        GO_VERSION_FILE: ${{ inputs.go-version-file }}
+      run: |
+        set -uo pipefail
+        if ! top=$(git -C "$(dirname "$GO_VERSION_FILE")" rev-parse --show-toplevel 2>/dev/null); then
+          echo "Not a git work tree; leaving mtimes as checked out."
+          exit 0
+        fi
+        cd "$top" || exit 0
+        dirty="$(mktemp)"
+        if ! git diff --name-only -z HEAD > "$dirty" ||
+          ! git ls-tree -r -t -z --full-tree HEAD | DIRTY="$dirty" perl -0ne '
+            BEGIN {
+              open(my $fh, "<", $ENV{DIRTY}) or die "open $ENV{DIRTY}: $!";
+              local $/ = "\0";
+              while (my $p = <$fh>) {
+                chomp $p;
+                # A changed path and every directory above it keep their real mtime.
+                do { $skip{$p} = 1 } while ($p =~ s{/[^/]*\z}{});
+              }
+            }
+            chomp;
+            my ($meta, $path) = split /\t/, $_, 2;
+            my ($mode, $type, $oid) = split / /, $meta;
+            next if $skip{$path};
+            # Directories and regular files only: no symlinks, no submodules.
+            next unless $type eq "tree" || $mode eq "100644" || $mode eq "100755";
+            # 28 bits of the object id as seconds after 2000-01-01 (2000-2008).
+            my $t = 946684800 + hex(substr($oid, 0, 7));
+            $n++ if utime($t, $t, $path);
+            END { printf "Normalized the mtimes of %d tracked paths.\n", $n // 0 }
+          '; then
+          echo "::warning title=setup-go::Could not normalize tracked-file mtimes; tests that read repo files will not hit the Go test cache this run."
+        fi
+        rm -f "$dirty"
+
+    # Module + build caches, scoped per calling job (or per `cache-name`) and
+    # keyed per REFRESH WINDOW (`cache-refresh-hours`, default one UTC day),
+    # so PRs restore a default-branch cache at most one window old. A key
+    # with no time component froze: actions/cache never re-saves a key it
+    # hit, so one entry per go.sum stood for every later commit, and legate's
+    # PRs reran ~5 min of tests for packages they never touched because the
+    # cache predated 35 commits of main.
+    #
+    # The window, not the commit, is what bounds the entry COUNT. Superseded
+    # entries are never deleted (that needs `actions: write`, which the org's
+    # read-only default token lacks and a composite cannot grant), so they
+    # sit against the 10 GB per-repo cap until LRU evicts them, shortening
+    # how long every other cache in the repo survives. A per-commit key wrote
+    # one ~1 GB entry per push; this writes at most one per scope per window
+    # (pinpredict/.github#62 is the same churn in pre-commit-advisory).
+    #
+    # Only a run on the default branch saves, and its restore stays inside
+    # the same go.mod/go.sum hash, which is what bounds each entry's SIZE:
+    # the module set cannot change within it, and Go trims build-cache
+    # entries unused for 5 days. A seed that restored across go.sum changes
+    # is how the pre-commit Go cache grew 4.7x until it filled a runner's
+    # disk (#69). The cost: the first default-branch run after ANY go.mod or
+    # go.sum change in the repo compiles from cold (legate: 12 such commits
+    # in the 30 days to 2026-10-25). Every other run (PRs, tags, merge queue)
+    # restores only, falling back to the same scope with an older go.sum
     # (near-warm after a dep bump), then to any scope (a cold test job still
     # inherits the build job's module download cache). Paths are the Linux
     # defaults — every pinpredict runner (GitHub-hosted and the EKS/ARC scale
     # sets) is Linux; a macOS caller would just miss the cache, not break.
-    - name: Restore Go module + build caches
+    - name: Compute the Go cache refresh window
+      id: go-cache-window
       if: ${{ inputs.cache-name != 'false' }}
+      shell: bash
+      env:
+        REFRESH_HOURS: ${{ inputs.cache-refresh-hours }}
+      run: |
+        set -euo pipefail
+        hours="$REFRESH_HOURS"
+        if ! [[ "$hours" =~ ^[1-9][0-9]*$ ]]; then
+          echo "::warning title=setup-go::cache-refresh-hours must be a positive integer, got '$hours'; using 24."
+          hours=24
+        fi
+        echo "window=$(( $(date -u +%s) / (hours * 3600) ))" >> "$GITHUB_OUTPUT"
+
+    - name: Restore and save Go module + build caches
+      if: ${{ inputs.cache-name != 'false' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
       uses: actions/cache@v6
       with:
         path: |
           ~/go/pkg/mod
           ~/.cache/go-build
-        key: setup-go-job-${{ runner.os }}-${{ runner.arch }}-${{ inputs.cache-name || github.job }}-${{ hashFiles(inputs.go-version-file, '**/go.sum') }}
+        key: setup-go-job-${{ runner.os }}-${{ runner.arch }}-${{ inputs.cache-name || github.job }}-${{ hashFiles(inputs.go-version-file, '**/go.sum') }}-${{ steps.go-cache-window.outputs.window }}
         restore-keys: |
+          setup-go-job-${{ runner.os }}-${{ runner.arch }}-${{ inputs.cache-name || github.job }}-${{ hashFiles(inputs.go-version-file, '**/go.sum') }}-
+
+    - name: Restore Go module + build caches
+      if: ${{ inputs.cache-name != 'false' && github.ref != format('refs/heads/{0}', github.event.repository.default_branch) }}
+      uses: actions/cache/restore@v6
+      with:
+        path: |
+          ~/go/pkg/mod
+          ~/.cache/go-build
+        key: setup-go-job-${{ runner.os }}-${{ runner.arch }}-${{ inputs.cache-name || github.job }}-${{ hashFiles(inputs.go-version-file, '**/go.sum') }}-${{ steps.go-cache-window.outputs.window }}
+        restore-keys: |
+          setup-go-job-${{ runner.os }}-${{ runner.arch }}-${{ inputs.cache-name || github.job }}-${{ hashFiles(inputs.go-version-file, '**/go.sum') }}-
           setup-go-job-${{ runner.os }}-${{ runner.arch }}-${{ inputs.cache-name || github.job }}-
           setup-go-job-${{ runner.os }}-${{ runner.arch }}-
 

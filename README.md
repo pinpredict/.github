@@ -29,7 +29,7 @@ Why `.github` and not a dedicated `github-actions` repo: `.github` is *the* GitH
 | `setup-python-uv` | Install uv + a pinned Python version + (default-on) `uv sync`. |
 | `setup-node-pnpm` | corepack + setup-node@v4 with pnpm cache + (default-on) `pnpm install --frozen-lockfile`. Accepts a `pnpm-filter` input for workspace filtering. |
 | `setup-dotnet` | setup-dotnet@v5 with NuGet cache keyed on `**/*.csproj` + (default-off) `dotnet tool restore`. |
-| `setup-go` | setup-go@v6 reading version from `go.mod`, with the Go module + build caches keyed **per calling job** (`github.job`) instead of setup-go's built-in single-per-go.sum key — under the built-in scheme the first job to save wins the key and e.g. a `go test -race -cover…` job recompiles the whole dependency graph on every run (~3.5 min in k5s vs ~30 s of tests) because its race-instrumented artifacts are never saved. `cache-name` overrides the scope (fixed name to share between jobs; `"false"` disables). Optional `private-modules: true` mints a short-lived read-only `pinpredict-argocd` App token and configures git + `GOPRIVATE` so `go`/`golangci-lint`/`goreleaser` fetch a private pinpredict module (e.g. `github.com/pinpredict/ppkit`) without vendoring — the non-Docker analogue of `docker-release.yml`'s `private-modules` secret. Default false. |
+| `setup-go` | setup-go@v6 reading version from `go.mod`, with the Go module + build caches keyed **per calling job** (`github.job`) instead of setup-go's built-in single-per-go.sum key — under the built-in scheme the first job to save wins the key and e.g. a `go test -race -cover…` job recompiles the whole dependency graph on every run (~3.5 min in k5s vs ~30 s of tests) because its race-instrumented artifacts are never saved. The key also carries a refresh window, and **only default-branch runs save**: the first one in each window restores the newest cache for the same `go.mod`/`go.sum` and saves a new entry, so PRs (restore-only) start from a main cache at most one window old rather than whichever commit first saved for that `go.sum`. `cache-refresh-hours` (default `24`, one UTC day) sets the window; superseded entries are never deleted, so a shorter window means more entries waiting for LRU eviction against the repo's 10 GB cache cap. The first default-branch run after any `go.mod`/`go.sum` change compiles from cold. `cache-name` overrides the scope (fixed name to share between jobs; `"false"` disables). `normalize-mtimes` (default `true`) gives each clean tracked file and directory an mtime derived from its git object id, so a test that reads repo files (testdata, charts) can still hit Go's test cache after a fresh checkout; set `"false"` for a job that relies on checkout-time mtimes. Optional `private-modules: true` mints a short-lived read-only `pinpredict-argocd` App token and configures git + `GOPRIVATE` so `go`/`golangci-lint`/`goreleaser` fetch a private pinpredict module (e.g. `github.com/pinpredict/ppkit`) without vendoring — the non-Docker analogue of `docker-release.yml`'s `private-modules` secret. Default false. |
 
 #### Language setup composites — usage
 
@@ -62,6 +62,10 @@ Why `.github` and not a dedicated `github-actions` repo: `.github` is *the* GitH
     # cache-name: "shared"    # optional; default "" = per-job cache scope
                               # (github.job). Fixed name shares a cache across
                               # jobs that compile identically; "false" disables.
+    # cache-refresh-hours: "6" # optional; default "24" = at most one new default-branch
+                              # cache entry per scope per UTC day.
+    # normalize-mtimes: "false" # optional; default true = content-derived mtimes
+                              # on tracked files so Go's test cache survives checkout.
 
 # Go, fetching a private pinpredict module without vendoring (e.g. k4a → ppkit)
 - uses: pinpredict/.github/actions/setup-go@main
