@@ -62,6 +62,9 @@ The key ends in a refresh window (`cache-refresh-hours`, default one UTC day). B
 - **Entry size: the default-branch restore stays inside the same `go.mod`/`go.sum` hash**, so no superseded modules carry forward and Go's own 5-day trim bounds the build cache. Do not add the cross-`go.sum` restore-keys to the saving step; that is the growth pattern behind the pre-commit cache incident above. The cost is a cold default-branch run after every `go.mod`/`go.sum` change anywhere in the repo (legate: 12 in the 30 days to 2026-10-25).
 - **Entry count: at most one save per scope per window.** Superseded entries are never deleted (that needs `actions: write`, which the org's read-only default token lacks and a composite cannot grant), so they wait for LRU eviction against the 10 GB per-repo cap, and every extra one shortens how long the repo's other caches survive. A per-commit key (the first cut of this design) wrote ~1 GB per push into repos already at the cap; do not go back to `github.sha` without a deletion step. #62 is the same churn in `pre-commit-advisory.yml`.
 - **No PR-scoped copies: PR, tag and merge-queue runs restore only.** A PR-scoped entry can serve only that PR.
+
+`normalize-mtimes` exists because Go keys a cached test result on the size and mtime of every repo file the test opened, and a checkout restamps them all. Without it a package whose tests read testdata or a chart reruns on every run however warm the cache is.
+
 ## Editing playbook
 
 - **Changing the docker matrix shape** in `discover-services/action.yml`: its docker-release consumer now lives only on the frozen `@pre-stevedore` tag (never retarget it) — pinned callers' `ci.yml` files still read the matrix output, so treat the shape as frozen until the stevedore migration completes.
