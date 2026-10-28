@@ -1,0 +1,21 @@
+# CODEOWNERS — automatic reviewer assignment for pinpredict/.github
+#
+# Without this file nothing requests a reviewer, so every review has to be
+# asked for by hand. GitHub's scheduled reminders also key off review requests.
+#
+# Syntax: last matching pattern wins; listing several owners requests all of
+# them. GitHub never requests review from the PR's own author, so an owner who
+# opens a PR simply drops out of that one. Last-match-wins is per FILE: a PR
+# that touches two areas requests both lists.
+#
+# Owners are individual GitHub handles, never org teams. Every area has at
+# least two, so nothing blocks on one person and a sole author's own PRs still
+# get a reviewer.
+#
+# Org-default repo: the reusable workflows and composite actions every service
+# repo's CI calls. A change here lands in every repo's next CI run, so it is
+# reviewed by the people who operate CI, not by whoever needed the action.
+#
+# Engineers: blairham (Blair), emersonboyd (Emerson).
+
+*                                   @blairham @emersonboyd
