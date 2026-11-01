@@ -112,11 +112,12 @@ on:
         # released" (blairham/stevedore#23). v1.0.4-v1.0.5 are docs/CI only.
         # v1.2.0 = opt-in `versioning.bump: auto` (Conventional Commits, scoped
         # per image); `strategy: ecr` + `bump: patch` behaves as before. The
-        # action ref STAYS @v1.0.3, whose download pattern matches v1.2.0's
-        # assets: the @v1.2.0 action always runs sigstore/cosign-installer,
-        # which needs `envsubst`, and our ARC runner image has none (exit 127
-        # on both legs of legate run 41355337622). Move the action once
-        # pinpredict/runner-image ships gettext-base. Since v1.1.0 a leg refuses an unset env-backed build secret (a caller
+        # action is @v1.2.0 too: it verifies the binary against its
+        # cosign-signed checksums.txt, so it runs sigstore/cosign-installer on
+        # every install, install-cosign: "false" included (the v1.0.3 note
+        # above no longer holds). cosign-installer needs `envsubst`, which the
+        # ARC runner image ships since pinpredict/runner-image#3.
+        # Since v1.1.0 a leg refuses an unset env-backed build secret (a caller
         # declaring gh_token must pass private-modules: true; every current one
         # does; merge builds nothing and is not checked), and merge refuses a
         # commit that is not on the default branch.
@@ -178,7 +179,7 @@ jobs:
       - name: Stevedore plan
         id: plan
         if: ${{ steps.manual.outputs.value == '' }}
-        uses: blairham/stevedore@v1.0.3
+        uses: blairham/stevedore@v1.2.0
         env:
           REGISTRY: ${{ steps.ecr-login.outputs.registry }}
         with:
@@ -282,7 +283,7 @@ jobs:
           permission-contents: read
 
       - name: Stevedore split leg
-        uses: blairham/stevedore@v1.0.3
+        uses: blairham/stevedore@v1.2.0
         env:
           REGISTRY: ${{ steps.ecr-login.outputs.registry }}
           GH_PRIVATE_TOKEN: ${{ steps.private-module-token.outputs.token }}
@@ -336,7 +337,7 @@ jobs:
 
       - name: Stevedore merge
         id: stevedore
-        uses: blairham/stevedore@v1.0.3
+        uses: blairham/stevedore@v1.2.0
         env:
           REGISTRY: ${{ steps.ecr-login.outputs.registry }}
         with:
