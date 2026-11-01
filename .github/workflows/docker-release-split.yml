@@ -110,7 +110,16 @@ on:
         # instead of rebuilding every image from the stray commit, and a failed
         # or non-fast-forward marker fetch no longer degrades to "never
         # released" (blairham/stevedore#23). v1.0.4-v1.0.5 are docs/CI only.
-        default: "v1.0.6"
+        # v1.2.0 = opt-in `versioning.bump: auto` (Conventional Commits, scoped
+        # per image); `strategy: ecr` + `bump: patch` behaves as before. Paired
+        # with the action at @v1.2.0, which verifies the binary against its
+        # cosign-signed checksums.txt and so installs cosign even with
+        # install-cosign: "false" (the v1.0.3 note above no longer holds).
+        # Since v1.1.0 a leg refuses an unset env-backed build secret (a caller
+        # declaring gh_token must pass private-modules: true; every current one
+        # does; merge builds nothing and is not checked), and merge refuses a
+        # commit that is not on the default branch.
+        default: "v1.2.0"
 
 env:
   AWS_REGION: us-east-1
@@ -168,7 +177,7 @@ jobs:
       - name: Stevedore plan
         id: plan
         if: ${{ steps.manual.outputs.value == '' }}
-        uses: blairham/stevedore@v1.0.3
+        uses: blairham/stevedore@v1.2.0
         env:
           REGISTRY: ${{ steps.ecr-login.outputs.registry }}
         with:
@@ -272,7 +281,7 @@ jobs:
           permission-contents: read
 
       - name: Stevedore split leg
-        uses: blairham/stevedore@v1.0.3
+        uses: blairham/stevedore@v1.2.0
         env:
           REGISTRY: ${{ steps.ecr-login.outputs.registry }}
           GH_PRIVATE_TOKEN: ${{ steps.private-module-token.outputs.token }}
@@ -326,7 +335,7 @@ jobs:
 
       - name: Stevedore merge
         id: stevedore
-        uses: blairham/stevedore@v1.0.3
+        uses: blairham/stevedore@v1.2.0
         env:
           REGISTRY: ${{ steps.ecr-login.outputs.registry }}
         with:
