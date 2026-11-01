@@ -103,7 +103,16 @@ on:
         # instead of rebuilding every image from the stray commit, and a failed
         # or non-fast-forward marker fetch no longer degrades to "never
         # released" (blairham/stevedore#23). v1.0.4-v1.0.5 are docs/CI only.
-        default: "v1.0.6"
+        # v1.2.0 = opt-in `versioning.bump: auto` (Conventional Commits, scoped
+        # per image); `strategy: ecr` + `bump: patch` behaves as before. The
+        # action ref STAYS @v1.0.3, whose download pattern matches v1.2.0's
+        # assets: the @v1.2.0 action always runs sigstore/cosign-installer,
+        # which needs `envsubst`, and our ARC runner image has none (exit 127
+        # on both legs of legate run 41355337622). Move the action once
+        # pinpredict/runner-image ships gettext-base. Since v1.1.0 a real release refuses an unset env-backed build secret
+        # (a caller declaring gh_token must pass private-modules: true; every
+        # current one does) and a commit that is not on the default branch.
+        default: "v1.2.0"
 
 env:
   AWS_REGION: us-east-1
