@@ -113,7 +113,11 @@ on:
         # Since v1.1.0 a real release refuses an unset env-backed build secret
         # (a caller declaring gh_token must pass private-modules: true; every
         # current one does) and a commit that is not on the default branch.
-        default: "v1.2.0"
+        # v1.2.1 = a split release's merge no longer checks build secrets
+        # (blairham/stevedore#174). This workflow has no merge step, so nothing
+        # here changes; it moves with docker-release-split.yml to keep both on
+        # one release. The action is @v1.2.1 too.
+        default: "v1.2.1"
 
 env:
   AWS_REGION: us-east-1
@@ -214,7 +218,7 @@ jobs:
         id: stevedore
         # uses: refs cannot be expressions — pin the action; the `version`
         # input below selects the binary that actually runs.
-        uses: blairham/stevedore@v1.2.0
+        uses: blairham/stevedore@v1.2.1
         env:
           # ECR host, e.g. 123456789.dkr.ecr.us-east-1.amazonaws.com — the
           # .stevedore.yaml repositories template this as {{ .Env.REGISTRY }}.

@@ -119,9 +119,13 @@ on:
         # ARC runner image ships since pinpredict/runner-image#3.
         # Since v1.1.0 a leg refuses an unset env-backed build secret (a caller
         # declaring gh_token must pass private-modules: true; every current one
-        # does; merge builds nothing and is not checked), and merge refuses a
-        # commit that is not on the default branch.
-        default: "v1.2.0"
+        # does), and merge refuses a commit that is not on the default branch.
+        # v1.2.1 = merge no longer checks build secrets (blairham/stevedore#174).
+        # v1.1.0-v1.2.0 checked them in merge too, and merge never mints the
+        # gh_token, so every caller declaring it failed at merge after both
+        # legs had pushed: trader-tools from 2026-11-01 23:43Z. The action is
+        # @v1.2.1 too.
+        default: "v1.2.1"
 
 env:
   AWS_REGION: us-east-1
@@ -179,7 +183,7 @@ jobs:
       - name: Stevedore plan
         id: plan
         if: ${{ steps.manual.outputs.value == '' }}
-        uses: blairham/stevedore@v1.2.0
+        uses: blairham/stevedore@v1.2.1
         env:
           REGISTRY: ${{ steps.ecr-login.outputs.registry }}
         with:
@@ -283,7 +287,7 @@ jobs:
           permission-contents: read
 
       - name: Stevedore split leg
-        uses: blairham/stevedore@v1.2.0
+        uses: blairham/stevedore@v1.2.1
         env:
           REGISTRY: ${{ steps.ecr-login.outputs.registry }}
           GH_PRIVATE_TOKEN: ${{ steps.private-module-token.outputs.token }}
@@ -337,7 +341,7 @@ jobs:
 
       - name: Stevedore merge
         id: stevedore
-        uses: blairham/stevedore@v1.2.0
+        uses: blairham/stevedore@v1.2.1
         env:
           REGISTRY: ${{ steps.ecr-login.outputs.registry }}
         with:
